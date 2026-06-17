@@ -1,0 +1,12 @@
+{
+  "domain": "mycupra",
+  "name": "MyCupra (Read-Only)",
+  "codeowners": ["@eragon02424"],
+  "config_flow": true,
+  "documentation": "https://github.com/eragon02424/MyCupra_ReadOnly",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/eragon02424/MyCupra_ReadOnly/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "MyCupra (Read-Only) einrichten",
+        "description": "Zugangsdaten für das EU Data Act Portal (eu-data-act.drivesomethinggreater.com). Es wird ausschließlich lesend zugegriffen, keine Fahrzeugsteuerung möglich.",
+        "data": {
+          "email": "E-Mail (Cupra/SEAT Login)",
+          "password": "Passwort",
+          "vin": "Fahrzeug-VIN",
+          "device_name": "Gerätename",
+          "request_identifier": "Anfrage-Identifier (Daueranfrage im Portal)",
+          "update_interval_minutes": "Update-Intervall (Minuten)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung fehlgeschlagen (Netzwerkproblem oder Server vorübergehend nicht erreichbar). Bitte erneut versuchen.",
+      "invalid_auth": "Anmeldung fehlgeschlagen. Bitte E-Mail, Passwort, VIN und Anfrage-Identifier prüfen.",
+      "unknown": "Unerwarteter Fehler. Bitte Logs prüfen."
+    },
+    "abort": {
+      "already_configured": "Dieses Fahrzeug (VIN) ist bereits eingerichtet."
+    }
+  }
+}
