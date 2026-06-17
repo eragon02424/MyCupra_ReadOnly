@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "MyCupra (Read-Only) einrichten",
-        "description": "Zugangsdaten für das EU Data Act Portal (eu-data-act.drivesomethinggreater.com). Es wird ausschließlich lesend zugegriffen, keine Fahrzeugsteuerung möglich.",
+        "description": "Diese Integration liest Fahrzeugdaten nur lesend aus dem EU Data Act Portal aus (eu-data-act.drivesomethinggreater.com). Keine Fahrzeugsteuerung möglich.\n\n**Vorbereitung im Portal (einmalig, bevor du hier fortfährst):**\n1. Melde dich auf eu-data-act.drivesomethinggreater.com mit deinen Cupra/SEAT-Zugangsdaten an.\n2. Lege dort eine neue Datenanfrage an (z.B. mit dem Namen \"Home Assistant\").\n3. Wähle dein Fahrzeug (VIN) aus und bestätige die Anfrage.\n4. Das Portal generiert ab sofort alle 15 Minuten eine neue Datendatei für diese Anfrage. Das kann beim ersten Mal etwas dauern, bis die erste Datei bereitsteht.\n5. Merke dir den Anfrage-Identifier dieser Anfrage (in der URL oder den Anfrage-Details im Portal sichtbar) - den brauchst du unten im Feld \"Anfrage-Identifier\".\n\nTrage anschließend unten deine Zugangsdaten und die VIN ein. Beim Speichern wird ein echter Anmeldeversuch durchgeführt, damit Tippfehler sofort auffallen.",
         "data": {
           "email": "E-Mail (Cupra/SEAT Login)",
           "password": "Passwort",
