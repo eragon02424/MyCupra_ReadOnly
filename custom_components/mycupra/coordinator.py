@@ -1,21 +1,11 @@
-"""DataUpdateCoordinator für die MyCupra (Read-Only) Integration.
-
-Wichtig: cupra_client.CupraClient ist bewusst synchron (blockierende Netzwerk-
-aufrufe, blockierendes time.sleep() in der Retry-Logik). Home Assistant läuft
-in einer asyncio-Event-Loop, in der blockierender Code NIEMALS direkt aufgerufen
-werden darf, da das den gesamten HA-Kern einfrieren würde.
-
-Die Lösung: hass.async_add_executor_job() führt den synchronen Code in einem
-separaten Thread aus, die Event-Loop bleibt frei. Das ist insbesondere wichtig,
-weil CupraClient.list_files()/download_latest() bei anhaltenden Netzwerk-
-problemen über die gestaffelte Backoff-Strategie (siehe cupra_client.py)
-theoretisch stundenlang blockieren können (10s -> 1min -> 10min -> 20min ->
-stündlich, siehe RETRY_SCHEDULE) - das darf niemals im HA-Hauptthread laufen.
-"""
+"""DataUpdateCoordinator für die MyCupra (Read-Only) Integration."""
 
 from __future__ import annotations
 
+import io
+import json
 import logging
+import zipfile
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -36,8 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class MyCupraCoordinator(DataUpdateCoordinator[dict]):
-    """Holt periodisch die neueste Datendatei vom EU Data Act Portal und
-    stellt das geparste Ergebnis den Sensor-Entities zur Verfügung."""
+    """Holt periodisch die neueste Datendatei vom EU Data Act Portal."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
@@ -63,52 +52,103 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         )
 
     async def _async_update_data(self) -> dict:
-        """Wird von DataUpdateCoordinator in jedem Update-Intervall aufgerufen.
-
-        Läuft im Executor-Thread (siehe Modul-Docstring), damit die ggf. lange
-        blockierende Retry-Logik des CupraClient die HA-Event-Loop nicht
-        einfriert. Gibt das geparste JSON der neuesten Datendatei zurück.
-
-        ACHTUNG zur Retry-Architektur: CupraClient versucht bei vorübergehenden
-        Fehlern (Netzwerk, abgelehnter Token) bereits selbst unbegrenzt mit
-        gestaffelten Wartezeiten erneut (siehe RETRY_SCHEDULE in cupra_client.py).
-        Das heißt, dieser Coordinator-Aufruf kann im Fehlerfall sehr lange dauern
-        (Stunden), bevor er überhaupt zurückkehrt - das ist beabsichtigt und vom
-        Nutzer so gewünscht (dauerhafte automatische Wiederherstellung), läuft
-        aber dank async_add_executor_job in einem eigenen Thread, ohne HA zu
-        blockieren. CupraPermanentError (falsches Passwort, falsche VIN) wird
-        NICHT wiederholt und kommt sofort zurück - hier wird die Entity in HA
-        auf 'nicht verfügbar' gesetzt und ein Repair-Hinweis wäre über
-        UpdateFailed sichtbar."""
         try:
             raw_bytes, filename = await self.hass.async_add_executor_job(
                 self.client.download_latest
             )
         except CupraPermanentError as err:
-            # Dauerhafter Fehler (falsches Passwort, falsche VIN/Identifier) -
-            # Nutzer muss die Integration neu konfigurieren (Re-Auth-Flow).
-            raise UpdateFailed(
-                f"Dauerhafter Fehler, Konfiguration prüfen: {err}"
-            ) from err
+            raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
         except CupraLoginError as err:
-            # Sollte praktisch nicht auftreten, da CupraClient intern schon
-            # unbegrenzt retry-t - zur Sicherheit trotzdem abgefangen.
             raise UpdateFailed(f"Datenabruf fehlgeschlagen: {err}") from err
 
         parsed = await self.hass.async_add_executor_job(
             self._parse_zip, raw_bytes, filename
         )
+        _LOGGER.debug("Geparste Felder: %s", list(parsed.keys()))
         return parsed
 
     @staticmethod
     def _parse_zip(raw_bytes: bytes, filename: str) -> dict:
-        """Platzhalter für die ZIP/JSON-Auswertung.
+        """Entpackt die ZIP und wertet die JSON-Datei aus.
 
-        Wird im nächsten Schritt durch die separat entwickelte und getestete
-        Parsing-Logik ersetzt (siehe geplantes eigenständiges Auswertungs-Skript).
-        Gibt vorerst nur Metadaten zurück, damit der Coordinator schon jetzt
-        lauffähig ist und getestet werden kann."""
-        return {
-            "_raw_filename": filename,
-            "_raw_size_bytes": len(raw_bytes),
-        }
+        Antwortformat: {"vin": ..., "Data": [{"dataFieldName": ..., "value": ...}, ...]}
+        Bei mehrfach vorkommenden Feldnamen wird der erste Wert verwendet
+        (Felder kommen in Gruppen vor, der Inhalt ist identisch).
+        """
+        result = {"_raw_filename": filename, "_raw_size_bytes": len(raw_bytes)}
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                json_name = next(
+                    (n for n in zf.namelist() if n.endswith(".json")), None
+                )
+                if not json_name:
+                    _LOGGER.warning("Keine JSON-Datei in ZIP %s gefunden.", filename)
+                    return result
+                data = json.loads(zf.read(json_name))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Fehler beim Entpacken/Parsen von %s: %s", filename, err)
+            return result
+
+        fields: dict[str, str] = {}
+        for entry in data.get("Data", []):
+            name = entry.get("dataFieldName", "")
+            if name and name not in fields:
+                fields[name] = entry.get("value", "")
+
+        _LOGGER.debug("ZIP %s: %d eindeutige Felder", filename, len(fields))
+
+        # --- Numerische Felder ---
+        def _float(key: str):
+            v = fields.get(key)
+            try:
+                return float(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        def _int(key: str):
+            v = fields.get(key)
+            try:
+                return int(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        def _seconds_to_minutes(key: str):
+            """Konvertiert '33000s' -> 550 (Minuten)."""
+            v = fields.get(key)
+            if v is None:
+                return None
+            try:
+                return round(int(str(v).rstrip("s")) / 60)
+            except (ValueError, TypeError):
+                return None
+
+        result.update({
+            # Batterie
+            "soc":                      _int("battery_state_report.soc"),
+            "charge_power_kw":          _float("battery_state_report.charge_power"),
+            "charge_rate_km_h":         _float("battery_state_report.charge_rate"),
+            "remaining_charge_min":     _seconds_to_minutes("battery_state_report.remaining_charging_time_complete"),
+            "target_soc":               _int("settings.target_soc"),
+            "battery_care_limit":       _int("battery_care_mode.charge_bcam_threshold"),
+            # Fahrzeug
+            "mileage_km":               _int("mileage.value"),
+            "outdoor_temperature":      _float("outdoor_temperature"),
+            "min_temperature":          _float("min_temperature"),
+            "max_temperature":          _float("max_temperature"),
+            # Verbrauch
+            "climatization_consumption": _float("additional_consumptions.interior_climatization_consumption"),
+            "residual_consumption":      _float("additional_consumptions.residual_consumption"),
+            "ascent_consumption":        _float("slope_consumption_values.ascent_slope_consumption.physical_value"),
+            # Status (Text)
+            "charge_state":             fields.get("charging_state_report.current_charge_state"),
+            "charge_type":              fields.get("charging_state_report.charge_type"),
+            "charge_mode":              fields.get("charging_state_report.charge_mode"),
+            "update_reason":            fields.get("update_reason"),
+            # Binary
+            "locked":                   fields.get("locked") == "true" if fields.get("locked") is not None else None,
+            # Zeitstempel
+            "car_captured_at":          fields.get("car_captured_utc_timestamp"),
+        })
+
+        return result
