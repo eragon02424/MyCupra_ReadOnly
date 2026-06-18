@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Set up MyCupra (Read-Only)",
-        "description": "Sign in with your Cupra/SEAT credentials.\n\n**Preparation (required once in the portal):**\nCreate a recurring data request on eu-data-act.drivesomethinggreater.com (e.g. named \"Home Assistant\"). The portal will then generate a new data file every 15 minutes. VIN and request identifier are detected automatically.",
+        "description": "Before continuing, complete these steps in the EU Data Act Portal:\n\n1. Open eu-data-act.drivesomethinggreater.com and sign in with your Cupra/SEAT credentials.\n2. Click on your vehicle (Vehicle details).\n3. Scroll down to 'Your data files' and grant data access if not done yet.\n4. Create a new recurring request: click the plus icon or 'New request', select 'Recurring', give it a name (e.g. 'Home Assistant') and confirm.\n5. The portal will now generate a new data file every 15 minutes.\n\nOnly then enter your e-mail and password here. VIN and request identifier are detected automatically.",
         "data": {
           "email": "E-Mail (Cupra/SEAT login)",
           "password": "Password"
