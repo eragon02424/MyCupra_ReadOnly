@@ -1,9 +1,12 @@
 """Config Flow für die MyCupra (Read-Only) Integration.
 
-Mehrstufiger Flow:
+Mehrstufiger Config Flow:
   Schritt 1 (user):      E-Mail + Passwort -> Login + VINs automatisch auslesen
   Schritt 2 (vin):       VIN aus Dropdown auswählen -> Identifier automatisch auslesen
   Schritt 3 (settings):  Gerätename + Update-Intervall
+
+Options Flow (nachträgliche Änderung über Integrations-UI):
+  Gerätename und Update-Intervall können jederzeit geändert werden.
 """
 
 from __future__ import annotations
@@ -55,6 +58,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._client: CupraClient | None = None
         self._available_vins: list[str] = []
         self._prefill: dict[str, Any] = {}
+
+    @staticmethod
+    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> OptionsFlow:
+        return OptionsFlow(config_entry)
 
     # ------------------------------------------------------------------
     # Schritt 1: E-Mail + Passwort -> Login + VINs auslesen
@@ -136,7 +143,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     prefill={CONF_VIN: selected_vin, CONF_REQUEST_IDENTIFIER: identifier}
                 )
 
-        # Dropdown immer anzeigen (auch bei einer VIN - für Testzwecke sichtbar)
         return self.async_show_form(
             step_id="vin",
             data_schema=vol.Schema({
@@ -199,4 +205,42 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ): vol.All(int, vol.Range(min=5)),
             }),
             errors={},
+        )
+
+
+class OptionsFlow(config_entries.OptionsFlow):
+    """Nachträgliche Änderung von Gerätename und Update-Intervall."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        if user_input is not None:
+            # Geänderte Werte in den Config-Entry-Daten speichern
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                title=user_input[CONF_DEVICE_NAME],
+                data={
+                    **self._config_entry.data,
+                    CONF_DEVICE_NAME: user_input[CONF_DEVICE_NAME],
+                    CONF_UPDATE_INTERVAL_MINUTES: user_input[CONF_UPDATE_INTERVAL_MINUTES],
+                },
+            )
+            return self.async_create_entry(title="", data={})
+
+        current_name = self._config_entry.data.get(CONF_DEVICE_NAME, DEFAULT_DEVICE_NAME)
+        current_interval = self._config_entry.data.get(
+            CONF_UPDATE_INTERVAL_MINUTES, DEFAULT_UPDATE_INTERVAL_MINUTES
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({
+                vol.Optional(CONF_DEVICE_NAME, default=current_name): str,
+                vol.Optional(
+                    CONF_UPDATE_INTERVAL_MINUTES, default=current_interval
+                ): vol.All(int, vol.Range(min=5)),
+            }),
         )
