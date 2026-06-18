@@ -3,22 +3,22 @@
     "step": {
       "user": {
         "title": "MyCupra (Read-Only) einrichten",
-        "description": "Melde dich mit deinen Cupra/SEAT-Zugangsdaten an.\n\n**Vorbereitung (einmalig im Portal erforderlich):**\nLege auf eu-data-act.drivesomethinggreater.com eine Daueranfrage für dein Fahrzeug an (z.B. mit dem Namen \"Home Assistant\"). Das Portal generiert dann alle 15 Minuten eine neue Datendatei. Der Anfrage-Identifier wird danach automatisch erkannt.",
+        "description": "Melde dich mit deinen Cupra/SEAT-Zugangsdaten an.\n\n**Vorbereitung (einmalig im Portal erforderlich):**\nLege auf eu-data-act.drivesomethinggreater.com eine Daueranfrage für dein Fahrzeug an (z.B. mit dem Namen \"Home Assistant\"). Das Portal generiert dann alle 15 Minuten eine neue Datendatei. VIN und Anfrage-Identifier werden automatisch erkannt.",
         "data": {
           "email": "E-Mail (Cupra/SEAT Login)",
           "password": "Passwort"
         }
       },
       "vin": {
-        "title": "Fahrzeug-VIN eingeben",
-        "description": "Trage die 17-stellige Fahrzeugidentifikationsnummer (VIN) ein. Sie steht auf deinem Fahrzeugschein oder im EU Data Act Portal unter \"Vehicle Overview\".",
+        "title": "Fahrzeug auswählen",
+        "description": "Folgende Fahrzeuge wurden in deinem Portal-Account gefunden.",
         "data": {
-          "vin": "Fahrzeug-VIN (17 Zeichen)"
+          "vin": "Fahrzeug (VIN)"
         }
       },
       "settings": {
         "title": "Einstellungen",
-        "description": "Anfrage-Identifier wurde automatisch erkannt. Gib noch einen Gerätenamen und das gewünschte Update-Intervall ein.",
+        "description": "Fahrzeug und Anfrage-Identifier wurden automatisch erkannt. Gib noch einen Gerätenamen und das gewünschte Update-Intervall ein.",
         "data": {
           "device_name": "Gerätename",
           "update_interval_minutes": "Update-Intervall (Minuten, mindestens 5)"
@@ -28,7 +28,8 @@
     "error": {
       "cannot_connect": "Verbindung fehlgeschlagen (Netzwerkproblem oder Server vorübergehend nicht erreichbar).",
       "invalid_auth": "Anmeldung fehlgeschlagen. Bitte E-Mail und Passwort prüfen.",
-      "no_data_request": "Für diese VIN wurde keine Daueranfrage im Portal gefunden. Bitte zuerst auf eu-data-act.drivesomethinggreater.com eine Anfrage anlegen.",
+      "no_vehicles": "Keine Fahrzeuge im Portal gefunden. Bitte zuerst ein Fahrzeug auf eu-data-act.drivesomethinggreater.com registrieren.",
+      "no_data_request": "Für dieses Fahrzeug wurde keine Daueranfrage im Portal gefunden. Bitte zuerst auf eu-data-act.drivesomethinggreater.com eine Anfrage anlegen.",
       "unknown": "Unerwarteter Fehler. Bitte Logs prüfen."
     },
     "abort": {
