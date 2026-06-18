@@ -106,14 +106,6 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             except (ValueError, TypeError):
                 return None
 
-        def _float_positive(key: str):
-            """Wie _float, aber gibt None zurück wenn Wert <= 0.
-            VW nutzt -1.0 als Sentinel wenn ein Feld nicht anwendbar ist
-            (z.B. Laderate/Ladezeit wenn kein Ladevorgang aktiv).
-            """
-            v = _float(key)
-            return v if (v is not None and v > 0) else None
-
         def _int(key: str):
             v = fields.get(key)
             try:
@@ -121,16 +113,13 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             except (ValueError, TypeError):
                 return None
 
-        def _seconds_to_minutes_positive(key: str):
-            """Konvertiert '33000s' -> 550 (Minuten).
-            Gibt None zurück wenn der Wert <= 0 ist (Sentinel).
-            """
+        def _seconds_to_minutes(key: str):
+            """Konvertiert '33000s' -> 550 (Minuten)."""
             v = fields.get(key)
             if v is None:
                 return None
             try:
-                minutes = round(int(str(v).rstrip("s")) / 60)
-                return minutes if minutes > 0 else None
+                return round(int(str(v).rstrip("s")) / 60)
             except (ValueError, TypeError):
                 return None
 
@@ -138,8 +127,8 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             # Batterie
             "soc":                      _int("battery_state_report.soc"),
             "charge_power_kw":          _float("battery_state_report.charge_power"),
-            "charge_rate_km_h":         _float_positive("battery_state_report.charge_rate"),
-            "remaining_charge_min":     _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete"),
+            "charge_rate_km_h":         _float("battery_state_report.charge_rate"),
+            "remaining_charge_min":     _seconds_to_minutes("battery_state_report.remaining_charging_time_complete"),
             "target_soc":               _int("settings.target_soc"),
             "battery_care_limit":       _int("battery_care_mode.charge_bcam_threshold"),
             # Fahrzeug
