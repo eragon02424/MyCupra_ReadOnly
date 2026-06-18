@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up MyCupra (Read-Only)",
+        "description": "Sign in with your Cupra/SEAT credentials.\n\n**Preparation (required once in the portal):**\nCreate a recurring data request on eu-data-act.drivesomethinggreater.com (e.g. named \"Home Assistant\"). The portal will then generate a new data file every 15 minutes. VIN and request identifier are detected automatically.",
+        "data": {
+          "email": "E-Mail (Cupra/SEAT login)",
+          "password": "Password"
+        }
+      },
+      "vin": {
+        "title": "Select vehicle",
+        "description": "The following vehicles were found in your portal account.",
+        "data": {
+          "vin": "Vehicle (VIN)"
+        }
+      },
+      "settings": {
+        "title": "Settings",
+        "description": "Vehicle and request identifier were detected automatically. Enter a device name and the desired update interval.",
+        "data": {
+          "device_name": "Device name",
+          "update_interval_minutes": "Update interval (minutes, minimum 5)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Connection failed (network issue or server temporarily unavailable).",
+      "invalid_auth": "Login failed. Please check your e-mail and password.",
+      "no_vehicles": "No vehicles found in the portal. Please register a vehicle on eu-data-act.drivesomethinggreater.com first.",
+      "no_data_request": "No recurring data request found for this vehicle. Please create one on eu-data-act.drivesomethinggreater.com first.",
+      "unknown": "Unexpected error. Please check the logs."
+    },
+    "abort": {
+      "already_configured": "This vehicle (VIN) is already configured."
+    }
+  }
+}
