@@ -35,5 +35,17 @@
     "abort": {
       "already_configured": "Dieses Fahrzeug (VIN) ist bereits eingerichtet."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "MyCupra Einstellungen",
+        "description": "Gerätename und Update-Intervall anpassen.",
+        "data": {
+          "device_name": "Gerätename",
+          "update_interval_minutes": "Update-Intervall (Minuten, mindestens 5)"
+        }
+      }
+    }
   }
 }
