@@ -33,10 +33,14 @@ REDIRECT_URI = "https://eu-data-act.drivesomethinggreater.com/login"
 IDENTITY_BASE = "https://identity.vwgroup.io"
 PORTAL_BASE = "https://eu-data-act.drivesomethinggreater.com"
 
-# "Home Assistant" Daueranfrage - liefert alle 15 Minuten eine neue ZIP-Datei.
-# Diese Identifier-ID bleibt über alle Generierungen hinweg gleich; nur der
-# Dateiname (z.B. 20260617151005_VIN.zip) ändert sich pro Generierung.
-DEFAULT_REQUEST_IDENTIFIER = "6s1d9sz06nzg7hbkpvg5z11p9q29u18s"
+# Default-Wert für die Anfrage-ID im Config-Flow. Bewusst LEER gelassen:
+# jeder Nutzer hat seine eigene, im EU-Data-Act-Portal selbst angelegte
+# Daueranfrage mit eigener Identifier-ID. Ein vorausgefüllter Wert (z.B. die
+# ID eines bestimmten Nutzers) wäre für alle anderen Nutzer falsch und sollte
+# daher nicht als Default in der Integration stehen.
+# Der Identifier wird automatisch nach dem Login via fetch_request_identifier()
+# aus dem Portal ausgelesen (GET /metadata/partial), falls er leer bleibt.
+DEFAULT_REQUEST_IDENTIFIER = ""
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -69,28 +73,15 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class CupraClient:
-    # Sicherheitspuffer: wir betrachten den Token schon als "abgelaufen", wenn
-    # weniger als diese Anzahl Sekunden Restgültigkeit übrig sind. Verhindert,
-    # dass ein Token mitten in einer mehrteiligen Anfrage (Liste -> Download)
-    # plötzlich ungültig wird.
     TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60
-
-    # Timeout pro einzelnem HTTP-Request. Verhindert, dass das Skript bei
-    # Netzwerkproblemen (z.B. Server antwortet gar nicht) endlos hängen bleibt.
     REQUEST_TIMEOUT_SECONDS = 15
-
-    # Gestaffelte Backoff-Strategie bei vorübergehenden Fehlern (Netzwerk,
-    # abgelehnter/abgelaufener Token). Jedes Tupel ist (Anzahl Versuche, Wartezeit
-    # in Sekunden zwischen diesen Versuchen). Die letzte Stufe wird unbegrenzt oft
-    # wiederholt (dauerhafter Betrieb), bis es entweder klappt oder ein dauerhafter
-    # Fehler auftritt (falsches Passwort, falsche VIN - siehe CupraPermanentError).
     RETRY_SCHEDULE = [
-        (10, 10),       # 10 Versuche, alle 10 Sekunden
-        (10, 60),       # 10 Versuche, alle 1 Minute
-        (10, 600),      # 10 Versuche, alle 10 Minuten
-        (10, 1200),     # 10 Versuche, alle 20 Minuten
+        (10, 10),
+        (10, 60),
+        (10, 600),
+        (10, 1200),
     ]
-    RETRY_FINAL_DELAY_SECONDS = 3600  # danach: unbegrenzt, stündlich
+    RETRY_FINAL_DELAY_SECONDS = 3600
 
     def __init__(self, email: str, password: str, vin: str,
                  request_identifier: str = DEFAULT_REQUEST_IDENTIFIER,
@@ -104,67 +95,35 @@ class CupraClient:
             urllib.request.HTTPCookieProcessor(self.cookie_jar),
             NoRedirectHandler(),
         )
-        # Unix-Timestamp, wann der aktuelle access_token abläuft. None = noch nie eingeloggt.
         self._token_expires_at = None
-        # Nur für Tests: Faktor >1 verkürzt alle Retry-Wartezeiten proportional,
-        # damit man die gestaffelte Backoff-Strategie nicht stundenlang live
-        # abwarten muss. Im Normalbetrieb (1.0) ohne Effekt.
         self._retry_speedup = retry_speedup
 
-    # ------------------------------------------------------------------
-    # Low-level Request-Helfer
-    # ------------------------------------------------------------------
     def _request(self, method, url, data=None, headers=None, allow_404=False):
-        """Führt einen HTTP-Request aus und gibt (status, response_headers, body) zurück.
-        Redirects (3xx) werden NICHT automatisch verfolgt - status wird einfach
-        zurückgegeben, der Aufrufer entscheidet was zu tun ist."""
         req_headers = {"User-Agent": USER_AGENT}
         if headers:
             req_headers.update(headers)
-
         body = None
         if data is not None:
             body = urllib.parse.urlencode(data).encode("utf-8")
             req_headers["Content-Type"] = "application/x-www-form-urlencoded"
-
         req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
-
         try:
             resp = self.opener.open(req, timeout=self.REQUEST_TIMEOUT_SECONDS)
-            status = resp.status
-            # WICHTIG: resp.headers NICHT mit dict(...) umwandeln - das zerstört
-            # die Case-Insensitivität von HTTP-Headern (z.B. "location" vs "Location").
-            # resp.headers ist ein email.message.Message-Objekt mit eingebautem,
-            # case-insensitivem .get() - das behalten wir bei.
-            resp_headers = resp.headers
-            content = resp.read()
-            return status, resp_headers, content
+            return resp.status, resp.headers, resp.read()
         except urllib.error.HTTPError as e:
-            # 3xx und 4xx landen wegen NoRedirectHandler / urllib hier als "Fehler",
-            # obwohl sie für uns gültige, erwartete Antworten sind.
             status = e.code
-            resp_headers = e.headers
             content = e.read()
             if status in (301, 302, 303, 307, 308) or allow_404:
-                return status, resp_headers, content
+                return status, e.headers, content
             error_text = content[:300].decode('utf-8', errors='replace')
             if status == 401:
-                # Token vom Server abgelehnt/invalidiert - ein erneuter Login
-                # behebt das typischerweise, daher retry-fähig.
                 raise CupraRetryableError(f"HTTP 401 bei {url} (Token ungültig): {error_text}")
             raise CupraLoginError(f"HTTP {status} bei {url}: {error_text}")
         except urllib.error.URLError as e:
-            # Netzwerkfehler ohne HTTP-Antwort: DNS-Fehler, Verbindung abgelehnt,
-            # Timeout, kein Internet etc. Retry-fähig, da sich solche Probleme oft
-            # innerhalb von Sekunden bis Minuten selbst beheben (z.B. Router-Neustart).
             raise CupraRetryableError(f"Netzwerkfehler bei {url}: {e.reason}")
 
-    # ------------------------------------------------------------------
-    # Hilfsfunktionen zum Extrahieren von CSRF/HMAC/relayState aus HTML
-    # ------------------------------------------------------------------
     @staticmethod
     def _extract_hidden_inputs(html: str) -> dict:
-        """Extrahiert _csrf/relayState/hmac aus klassischen <input type="hidden"> Feldern."""
         result = {}
         for name in ("_csrf", "relayState", "hmac"):
             m = re.search(rf'name="{name}"\s+value="([^"]*)"', html)
@@ -174,10 +133,6 @@ class CupraClient:
 
     @staticmethod
     def _extract_js_model_fields(html: str) -> dict:
-        """
-        Extrahiert csrf_token/hmac/relayState aus dem window._IDK.templateModel
-        JS-Objekt, wie es auf der Passwort-Seite (login/authenticate) vorkommt.
-        """
         result = {}
         m = re.search(r"csrf_token:\s*'([^']*)'", html)
         if m:
@@ -190,6 +145,110 @@ class CupraClient:
             result["relayState"] = m.group(1)
         return result
 
+    @staticmethod
+    def _extract_marketing_consent_fields(html: str) -> dict:
+        """
+        Extrahiert alle POST-Felder für .../consent/marketing/.../skip aus dem
+        window._IDK.templateModel JSON-Objekt im HTML der Consent-Seite.
+        Verifiziert anhand HAR-Aufzeichnung 18.06.2026.
+        """
+        result = {}
+        m = re.search(r"csrf_token:\s*'([^']*)'", html)
+        if m:
+            result["_csrf"] = m.group(1)
+        m = re.search(r'"documentKey":"([^"]*)"', html)
+        if m:
+            result["documentKey"] = m.group(1)
+        m = re.search(r'"relayStateToken":"([^"]*)"', html)
+        if m:
+            result["relayState"] = m.group(1)
+        m = re.search(r'"hmac":"([^"]*)"', html)
+        if m:
+            result["hmac"] = m.group(1)
+        m = re.search(r'"countryOfJurisdiction":"([^"]*)"', html)
+        if m:
+            result["countryOfJurisdiction"] = m.group(1)
+        m = re.search(r'"language":"([^"]*)"', html)
+        if m:
+            result["language"] = m.group(1)
+        m = re.search(r'"callback":"(https://[^"]*)"', html)
+        if m:
+            result["callback"] = m.group(1)
+        m = re.search(r'"step":"(\d+)"', html)
+        if m:
+            result["step"] = m.group(1)
+        channel_map = {"email": "channelemail", "mail": "channelmail",
+                       "phone": "channelphone", "app": "channelapp", "sms": "channelsms"}
+        m = re.search(r'"marketChannels":\[(.*?)\]', html)
+        if m:
+            channels_raw = m.group(1)
+            for channel_id, field_name in channel_map.items():
+                cm = re.search(
+                    rf'"channelId":"{channel_id}","channelType":"([^"]*)"', channels_raw
+                )
+                if cm:
+                    result[field_name] = "true" if cm.group(1) != "NOT_USED" else "false"
+        return result
+
+    def _handle_marketing_consent_if_present(self, current_url: str, body: bytes) -> str:
+        """
+        Behandelt optionale Marketing-Consent-Seiten nach dem Login automatisch
+        mit "Nicht jetzt". Muster (HAR 18.06.2026):
+          POST .../consent/marketing/{user_id}/{client_id}/0/skip -> 200
+          POST .../consent/marketing/{user_id}/{client_id}/1/skip -> 302
+        Gibt die finale Redirect-URL zurück.
+        """
+        html = body.decode("utf-8", errors="replace")
+        url = current_url.split("?")[0].rstrip("/") + "/skip"
+        guard = 0
+        while guard < 5:
+            guard += 1
+            fields = self._extract_marketing_consent_fields(html)
+            missing = [k for k in ("_csrf", "documentKey", "relayState", "hmac",
+                                    "countryOfJurisdiction", "language", "callback")
+                       if k not in fields]
+            if missing:
+                raise CupraLoginError(
+                    f"Marketing-Consent-Schritt {guard}: Felder nicht gefunden: {missing}"
+                )
+            logger.info(
+                "Marketing-Consent-Zwischenschritt (Durchlauf %d, documentKey=%s) - "
+                "lehne automatisch ab.", guard, fields["documentKey"]
+            )
+            status, headers, body = self._request(
+                "POST", url,
+                data={
+                    "_csrf": fields["_csrf"],
+                    "documentKey": fields["documentKey"],
+                    "relayState": fields["relayState"],
+                    "hmac": fields["hmac"],
+                    "countryOfJurisdiction": fields["countryOfJurisdiction"],
+                    "language": fields["language"],
+                    "callback": fields["callback"].replace(" ", "%20"),
+                    "channelemail": fields.get("channelemail", "false"),
+                    "channelmail": fields.get("channelmail", "false"),
+                    "channelphone": fields.get("channelphone", "false"),
+                    "channelapp": fields.get("channelapp", "false"),
+                    "channelsms": fields.get("channelsms", "false"),
+                },
+            )
+            if status == 302:
+                return headers["Location"]
+            if status == 200:
+                html = body.decode("utf-8", errors="replace")
+                next_fields = self._extract_marketing_consent_fields(html)
+                next_step = next_fields.get("step")
+                if not next_step:
+                    raise CupraLoginError(
+                        f"Marketing-Consent-Durchlauf {guard}: 'step' nicht gefunden."
+                    )
+                url = re.sub(r'/\d+/skip$', f'/{next_step}/skip', url)
+                continue
+            raise CupraLoginError(
+                f"Unerwarteter Status {status} bei Marketing-Consent-Durchlauf {guard}."
+            )
+        raise CupraLoginError("Marketing-Consent-Schleife nach 5 Durchläufen nicht beendet.")
+
     def _get_cookie(self, name: str):
         for cookie in self.cookie_jar:
             if cookie.name == name:
@@ -198,9 +257,6 @@ class CupraClient:
 
     @staticmethod
     def _decode_jwt_payload(token: str) -> dict:
-        """Dekodiert (ohne Signaturprüfung - reicht für unseren Zweck, da wir den
-        Token nur zur Ablaufzeit-Anzeige auslesen, nicht zur Autorisierung selbst
-        verwenden) den Payload-Teil eines JWT."""
         parts = token.split(".")
         if len(parts) < 2:
             return {}
@@ -208,8 +264,6 @@ class CupraClient:
         return json.loads(base64.urlsafe_b64decode(padded))
 
     def is_logged_in(self) -> bool:
-        """True, wenn ein aktuell noch gültiger access_token vorhanden ist
-        (mit Sicherheitspuffer, siehe TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS)."""
         if self._token_expires_at is None:
             return False
         if not self._get_cookie("access_token"):
@@ -217,19 +271,17 @@ class CupraClient:
         return time.time() < (self._token_expires_at - self.TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS)
 
     def ensure_logged_in(self) -> None:
-        """Loggt nur ein, wenn noch kein gültiger Token vorhanden ist.
-        Das ist die Methode, die vor jedem Datenzugriff aufgerufen werden sollte -
-        sie spart unnötige Logins, wenn der bestehende Token noch ausreichend
-        lange gültig ist."""
+        """Loggt ein falls nötig. Liest request_identifier automatisch aus dem
+        Portal aus, falls er noch leer ist (via fetch_request_identifier)."""
         if self.is_logged_in():
-            logger.debug("Bestehender Token ist noch gültig, kein erneuter Login nötig.")
-            return
-        logger.debug("Kein gültiger Token vorhanden, Login wird durchgeführt.")
-        self.login()
+            logger.debug("Token noch gültig, kein erneuter Login nötig.")
+        else:
+            logger.debug("Kein gültiger Token, Login wird durchgeführt.")
+            self.login()
+        if not self.request_identifier:
+            self.request_identifier = self.fetch_request_identifier()
 
     def _retry_delays(self):
-        """Generator, der die Wartezeiten gemäß RETRY_SCHEDULE liefert und danach
-        unbegrenzt RETRY_FINAL_DELAY_SECONDS weiterliefert (dauerhafter Betrieb)."""
         for count, delay in self.RETRY_SCHEDULE:
             for _ in range(count):
                 yield delay / self._retry_speedup
@@ -237,20 +289,6 @@ class CupraClient:
             yield self.RETRY_FINAL_DELAY_SECONDS / self._retry_speedup
 
     def _with_retry(self, func, *args, **kwargs):
-        """Führt func aus und versucht es bei CupraRetryableError (Netzwerkfehler,
-        abgelehnter/abgelaufener Token) gestaffelt und UNBEGRENZT erneut (siehe
-        RETRY_SCHEDULE) - läuft so lange weiter, bis es entweder klappt oder ein
-        CupraPermanentError auftritt. Vor jedem Retry wird der Token verworfen,
-        damit ensure_logged_in() beim nächsten Versuch sicher neu einloggt.
-
-        CupraPermanentError (falsches Passwort, falsche VIN, ungültiger Identifier)
-        wird NICHT wiederholt, da ein erneuter Versuch garantiert wieder fehlschlägt -
-        hier soll sofort und klar abgebrochen werden.
-
-        ACHTUNG: diese Methode kann (bei dauerhaften Netzwerkproblemen) sehr lange
-        blockieren (Stunden). Für den Einsatz in Home Assistant muss das in einem
-        eigenen Hintergrund-Mechanismus laufen, der den HA-Hauptthread nicht blockiert
-        - nicht direkt im synchronen Update-Pfad des Coordinators aufrufen."""
         attempt = 0
         for delay in self._retry_delays():
             attempt += 1
@@ -260,114 +298,93 @@ class CupraClient:
                 raise
             except CupraRetryableError as e:
                 logger.warning(
-                    "Versuch %d fehlgeschlagen (%s) - erneuter Versuch in %ds, "
-                    "Token wird dafür verworfen.",
+                    "Versuch %d fehlgeschlagen (%s) - erneuter Versuch in %ds.",
                     attempt, e, delay,
                 )
-                self._token_expires_at = None  # Erzwingt frischen Login beim Retry
+                self._token_expires_at = None
                 time.sleep(delay)
 
-    # ------------------------------------------------------------------
-    # Login-Flow, Schritt für Schritt - exakt wie im Browser nachgebildet
-    # und am 17.06.2026 manuell verifiziert.
-    # ------------------------------------------------------------------
     def login(self) -> None:
         logger.info("Schritt 1/9: Authorize-Request")
         authorize_params = {
-            "client_id": CLIENT_ID,
-            "response_type": "code",
-            "scope": SCOPE,
-            "state": STATE,
-            "redirect_uri": REDIRECT_URI,
-            "prompt": "login",
+            "client_id": CLIENT_ID, "response_type": "code", "scope": SCOPE,
+            "state": STATE, "redirect_uri": REDIRECT_URI, "prompt": "login",
         }
         url = f"{IDENTITY_BASE}/oidc/v1/authorize?{urllib.parse.urlencode(authorize_params)}"
         status, headers, _ = self._request("GET", url)
         if status != 302:
             raise CupraLoginError(f"Authorize fehlgeschlagen: HTTP {status}")
         signin_url = headers["Location"]
-        logger.debug("Signin-URL: %s", signin_url)
 
-        logger.info("Schritt 2/9: Signin-Seite laden (E-Mail-Formular)")
+        logger.info("Schritt 2/9: Signin-Seite laden")
         status, headers, body = self._request("GET", signin_url)
         html = body.decode("utf-8")
         fields = self._extract_hidden_inputs(html)
         if not fields.get("_csrf"):
-            raise CupraLoginError(
-                "Konnte CSRF-Token von der Signin-Seite nicht extrahieren. "
-                "Möglich: VW Group hat die Login-Seitenstruktur geändert "
-                "(nicht zwingend ein Problem mit den Zugangsdaten)."
-            )
+            raise CupraLoginError("CSRF-Token von Signin-Seite nicht extrahierbar.")
 
-        logger.info("Schritt 3/9: E-Mail senden (Identifier-POST)")
+        logger.info("Schritt 3/9: E-Mail senden")
         post_url = signin_url.split("?")[0].replace("/signin/", "/") + "/login/identifier"
-        status, headers, _ = self._request(
-            "POST", post_url,
-            data={
-                "_csrf": fields["_csrf"],
-                "relayState": fields["relayState"],
-                "hmac": fields["hmac"],
-                "email": self.email,
-            },
-        )
+        status, headers, _ = self._request("POST", post_url, data={
+            "_csrf": fields["_csrf"], "relayState": fields["relayState"],
+            "hmac": fields["hmac"], "email": self.email,
+        })
         if status != 303:
             raise CupraLoginError(f"E-Mail-Schritt fehlgeschlagen: HTTP {status}")
         authenticate_url = IDENTITY_BASE + headers["Location"]
-        logger.debug("Authenticate-URL: %s", authenticate_url)
 
         logger.info("Schritt 4/9: Passwort-Seite laden")
         status, headers, body = self._request("GET", authenticate_url)
         html = body.decode("utf-8")
         pw_fields = self._extract_js_model_fields(html)
         if not pw_fields.get("_csrf"):
-            raise CupraLoginError(
-                "Konnte CSRF-Token von der Passwort-Seite nicht extrahieren. "
-                "Möglich: VW Group hat die Login-Seitenstruktur geändert "
-                "(nicht zwingend ein Problem mit den Zugangsdaten)."
-            )
+            raise CupraLoginError("CSRF-Token von Passwort-Seite nicht extrahierbar.")
 
-        logger.info("Schritt 5/9: Passwort senden (Authenticate-POST)")
-        authenticate_post_url = authenticate_url.split("?")[0]
+        logger.info("Schritt 5/9: Passwort senden")
         status, headers, body = self._request(
-            "POST", authenticate_post_url,
+            "POST", authenticate_url.split("?")[0],
             data={
-                "_csrf": pw_fields["_csrf"],
-                "relayState": pw_fields["relayState"],
-                "hmac": pw_fields["hmac"],
-                "email": self.email,
-                "password": self.password,
+                "_csrf": pw_fields["_csrf"], "relayState": pw_fields["relayState"],
+                "hmac": pw_fields["hmac"], "email": self.email, "password": self.password,
             },
         )
         if status == 303:
             location = headers.get("Location", "")
             if "error=" in location:
                 error_match = re.search(r"error=([\w.]+)", location)
-                error_code = error_match.group(1) if error_match else "unbekannt"
-                raise CupraPermanentError(f"Login abgelehnt: {error_code}")
-            raise CupraLoginError(f"Unerwarteter 303-Redirect ohne Fehler-Code: {location}")
+                raise CupraPermanentError(
+                    f"Login abgelehnt: {error_match.group(1) if error_match else 'unbekannt'}"
+                )
+            raise CupraLoginError(f"Unerwarteter 303 ohne Fehler: {location}")
         if status != 302:
             raise CupraLoginError(f"Passwort-Schritt fehlgeschlagen: HTTP {status}")
         sso_url = headers["Location"]
 
         logger.info("Schritt 6/9: SSO-Redirect folgen")
-        status, headers, _ = self._request("GET", sso_url)
-        if status != 302:
+        status, headers, body = self._request("GET", sso_url)
+        if status == 200 and "/consent/marketing/" in sso_url:
+            consent_url = self._handle_marketing_consent_if_present(sso_url, body)
+        elif status != 302:
             raise CupraLoginError(f"SSO-Schritt fehlgeschlagen: HTTP {status}")
-        consent_url = headers["Location"]
+        else:
+            consent_url = headers["Location"]
 
         logger.info("Schritt 7/9: Consent-Redirect folgen")
-        status, headers, _ = self._request("GET", consent_url)
-        if status != 302:
+        status, headers, body = self._request("GET", consent_url)
+        if status == 200 and "/consent/marketing/" in consent_url:
+            callback_success_url = self._handle_marketing_consent_if_present(consent_url, body)
+        elif status != 302:
             raise CupraLoginError(f"Consent-Schritt fehlgeschlagen: HTTP {status}")
-        callback_success_url = headers["Location"]
+        else:
+            callback_success_url = headers["Location"]
 
-        logger.info("Schritt 8/9: Callback/success -> Authorization Code holen")
+        logger.info("Schritt 8/9: Callback/success -> Authorization Code")
         status, headers, _ = self._request("GET", callback_success_url)
         if status != 302:
             raise CupraLoginError(f"Callback-Schritt fehlgeschlagen: HTTP {status}")
         portal_login_url = headers["Location"]
 
-        logger.info("Schritt 9/9: Code beim Portal einlösen (access_token holen)")
+        logger.info("Schritt 9/9: Code beim Portal einlösen")
         status, headers, _ = self._request("GET", portal_login_url)
         if status != 302:
             raise CupraLoginError(f"Portal-Login fehlgeschlagen: HTTP {status}")
@@ -378,13 +395,8 @@ class CupraClient:
             raise CupraLoginError(f"Portal-Callback fehlgeschlagen: HTTP {status}")
 
         if not self._get_cookie("access_token"):
-            raise CupraLoginError(
-                "Login durchlaufen, aber kein access_token Cookie erhalten - "
-                "unerwarteter Zustand, bitte Flow erneut prüfen."
-            )
+            raise CupraLoginError("Login durchlaufen, aber kein access_token Cookie erhalten.")
 
-        # Ablaufzeit aus dem Token selbst auslesen (exp-Claim), damit
-        # ensure_logged_in() spätere unnötige Logins vermeiden kann.
         try:
             payload = self._decode_jwt_payload(self._get_cookie("access_token"))
             self._token_expires_at = payload["exp"]
@@ -394,30 +406,41 @@ class CupraClient:
                 self._token_expires_at - time.time(),
             )
         except Exception as e:
-            # Sollte das Token-Format sich mal ändern, ist das kein Show-Stopper -
-            # wir loggen dann beim nächsten Aufruf einfach sicherheitshalber neu ein.
-            logger.warning("Konnte Token-Ablaufzeit nicht auslesen (%s) - "
-                           "ensure_logged_in() wird beim nächsten Aufruf neu einloggen.", e)
+            logger.warning("Token-Ablaufzeit nicht auslesbar (%s) - Login beim nächsten Aufruf.", e)
             self._token_expires_at = None
 
-        logger.info("Login erfolgreich. access_token Cookie gesetzt.")
+        logger.info("Login erfolgreich.")
 
-    # ------------------------------------------------------------------
-    # Daten abrufen (erst Liste, dann gezielter Download)
-    # ------------------------------------------------------------------
+    def fetch_request_identifier(self) -> str:
+        """
+        Liest den Identifier der Daueranfrage automatisch aus dem Portal aus.
+        Endpunkt: GET /proxy_api/euda-apim/datarequest/vehicles/{VIN}/metadata/partial
+        Verifiziert anhand HAR-Aufzeichnung 18.06.2026.
+        Hinweis: /metadata/all liefert die one-time Anfrage - nicht verwenden.
+        """
+        # Direkt is_logged_in() statt ensure_logged_in() prüfen,
+        # da ensure_logged_in() seinerseits fetch_request_identifier() aufruft.
+        if not self.is_logged_in():
+            self.login()
+        url = f"{PORTAL_BASE}/proxy_api/euda-apim/datarequest/vehicles/{self.vin}/metadata/partial"
+        status, headers, body = self._request("GET", url)
+        if status != 200:
+            raise CupraLoginError(f"Identifier konnte nicht ausgelesen werden: HTTP {status}")
+        data = json.loads(body)
+        identifier = data.get("Identifier")
+        name = data.get("Name", "unbekannt")
+        if not identifier:
+            raise CupraLoginError(
+                "Kein Identifier in der Portal-Antwort. "
+                "Möglich: noch keine Daueranfrage (type=partial) im Portal angelegt."
+            )
+        logger.info("Daueranfrage gefunden: '%s' (Identifier: %s)", name, identifier)
+        return identifier
+
     def list_files(self) -> list:
-        """Liefert die Liste der verfügbaren Dateien für die Home-Assistant-Anfrage.
-        Loggt automatisch (erneut) ein, falls kein gültiger Token vorhanden ist.
-        Versucht es bei vorübergehenden Fehlern (Netzwerk, abgelehnter Token)
-        gestaffelt und unbegrenzt erneut (siehe RETRY_SCHEDULE)."""
         return self._with_retry(self._list_files_once)
 
     def validate_credentials(self) -> None:
-        """Prüft Login-Daten/VIN/Identifier durch einen EINMALIGEN Versuch (ohne
-        die unbegrenzte Retry-Logik von list_files()/download_latest()). Gedacht
-        für den Config-Flow beim Einrichten der Integration: dort soll bei
-        falschen Daten sofort ein Fehler im Dialog erscheinen, statt dass der
-        Dialog ggf. stundenlang auf einen Retry wartet."""
         self._list_files_once()
 
     def _list_files_once(self) -> list:
@@ -428,44 +451,30 @@ class CupraClient:
         )
         status, headers, body = self._request("GET", url, headers={"type": "partial"})
         if status == 400:
-            # 400 bedeutet i.d.R. ungültige VIN oder ungültiger Identifier -
-            # ein erneuter Versuch würde garantiert wieder fehlschlagen.
             raise CupraPermanentError(
-                f"Datei-Liste konnte nicht geladen werden (VIN/Identifier prüfen): "
+                f"Datei-Liste nicht geladen (VIN/Identifier prüfen): "
                 f"{body[:300].decode('utf-8', errors='replace')}"
             )
         if status != 200:
-            raise CupraLoginError(f"Datei-Liste konnte nicht geladen werden: HTTP {status}")
+            raise CupraLoginError(f"Datei-Liste nicht geladen: HTTP {status}")
         return json.loads(body)
 
     def download_latest(self):
-        """Lädt die neueste verfügbare ZIP-Datei herunter. Gibt (bytes, filename) zurück.
-        Versucht es bei vorübergehenden Fehlern gestaffelt und unbegrenzt erneut."""
         return self._with_retry(self._download_latest_once)
 
     def _download_latest_once(self):
         files = self._list_files_once()
         if not files:
-            raise CupraLoginError("Keine Dateien in der Liste verfügbar.")
-        files_sorted = sorted(files, key=lambda f: f["createdOn"], reverse=True)
-        latest = files_sorted[0]
-        logger.info("Neueste Datei: %s (erstellt %s, %s Bytes)",
-                    latest["name"], latest["createdOn"], latest.get("size"))
-
+            raise CupraLoginError("Keine Dateien verfügbar.")
+        latest = sorted(files, key=lambda f: f["createdOn"], reverse=True)[0]
+        logger.info("Neueste Datei: %s (%s Bytes)", latest["name"], latest.get("size"))
         url = (
             f"{PORTAL_BASE}/proxy_api/euda-apim/datadelivery/vehicles/"
             f"{self.vin}/{self.request_identifier}/download"
         )
         status, headers, body = self._request(
-            "GET", url,
-            headers={"type": "partial", "filename": latest["name"]},
+            "GET", url, headers={"type": "partial", "filename": latest["name"]},
         )
         if status != 200:
             raise CupraLoginError(f"Download fehlgeschlagen: HTTP {status}")
         return body, latest["name"]
-
-
-# Hinweis: dieses Modul wird von der MyCupra Home Assistant Integration importiert
-# (siehe coordinator.py). Für eigenständige Terminal-Tests außerhalb von HA
-# existiert weiterhin die unabhängige CLI-Version im Repo
-# MyCupra_ReadOnly/scripts/cupra_client_stdlib.py.
