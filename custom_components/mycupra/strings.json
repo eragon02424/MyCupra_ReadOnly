@@ -3,20 +3,33 @@
     "step": {
       "user": {
         "title": "MyCupra (Read-Only) einrichten",
-        "description": "Diese Integration liest Fahrzeugdaten nur lesend aus dem EU Data Act Portal aus (eu-data-act.drivesomethinggreater.com). Keine Fahrzeugsteuerung möglich.\n\n**Vorbereitung im Portal (einmalig, bevor du hier fortfährst):**\n1. Melde dich auf eu-data-act.drivesomethinggreater.com mit deinen Cupra/SEAT-Zugangsdaten an.\n2. Lege dort eine neue Datenanfrage an (z.B. mit dem Namen \"Home Assistant\").\n3. Wähle dein Fahrzeug (VIN) aus und bestätige die Anfrage.\n4. Das Portal generiert ab sofort alle 15 Minuten eine neue Datendatei für diese Anfrage. Das kann beim ersten Mal etwas dauern, bis die erste Datei bereitsteht.\n5. Merke dir den Anfrage-Identifier dieser Anfrage (in der URL oder den Anfrage-Details im Portal sichtbar) - den brauchst du unten im Feld \"Anfrage-Identifier\".\n\nTrage anschließend unten deine Zugangsdaten und die VIN ein. Beim Speichern wird ein echter Anmeldeversuch durchgeführt, damit Tippfehler sofort auffallen.",
+        "description": "Melde dich mit deinen Cupra/SEAT-Zugangsdaten an.\n\n**Vorbereitung (einmalig im Portal erforderlich):**\nLege auf eu-data-act.drivesomethinggreater.com eine Daueranfrage für dein Fahrzeug an (z.B. mit dem Namen \"Home Assistant\"). Das Portal generiert dann alle 15 Minuten eine neue Datendatei. VIN und Anfrage-Identifier werden danach automatisch erkannt.",
         "data": {
           "email": "E-Mail (Cupra/SEAT Login)",
-          "password": "Passwort",
-          "vin": "Fahrzeug-VIN",
+          "password": "Passwort"
+        }
+      },
+      "vin": {
+        "title": "Fahrzeug auswählen",
+        "description": "Folgende Fahrzeuge wurden in deinem Portal-Account gefunden.",
+        "data": {
+          "vin": "Fahrzeug (VIN)"
+        }
+      },
+      "settings": {
+        "title": "Einstellungen",
+        "description": "Fahrzeug und Anfrage-Identifier wurden automatisch erkannt. Gib noch einen Gerätenamen und das gewünschte Update-Intervall ein.",
+        "data": {
           "device_name": "Gerätename",
-          "request_identifier": "Anfrage-Identifier (Daueranfrage im Portal)",
-          "update_interval_minutes": "Update-Intervall (Minuten)"
+          "update_interval_minutes": "Update-Intervall (Minuten, mindestens 5)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Verbindung fehlgeschlagen (Netzwerkproblem oder Server vorübergehend nicht erreichbar). Bitte erneut versuchen.",
-      "invalid_auth": "Anmeldung fehlgeschlagen. Bitte E-Mail, Passwort, VIN und Anfrage-Identifier prüfen.",
+      "cannot_connect": "Verbindung fehlgeschlagen (Netzwerkproblem oder Server vorübergehend nicht erreichbar).",
+      "invalid_auth": "Anmeldung fehlgeschlagen. Bitte E-Mail und Passwort prüfen.",
+      "no_vehicles": "Keine Fahrzeuge im Portal für diesen Account gefunden. Bitte zuerst ein Fahrzeug im EU Data Act Portal registrieren.",
+      "no_data_request": "Für dieses Fahrzeug wurde keine Daueranfrage im Portal gefunden. Bitte zuerst auf eu-data-act.drivesomethinggreater.com eine Anfrage anlegen.",
       "unknown": "Unerwarteter Fehler. Bitte Logs prüfen."
     },
     "abort": {
