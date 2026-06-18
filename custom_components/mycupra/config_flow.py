@@ -2,7 +2,8 @@
 
 Mehrstufiger Flow:
   Schritt 1 (user):      E-Mail + Passwort eingeben -> Login validieren
-  Schritt 2 (vin):       VIN aus dem Portal auswählen (Dropdown)
+  Schritt 2 (vin):       VIN aus dem Portal auswählen (immer anzeigen,
+                         auch bei nur einem Fahrzeug, damit testbar)
   Schritt 3 (settings):  Gerätename + Update-Intervall, Identifier wird
                          automatisch aus dem Portal ausgelesen
 """
@@ -72,7 +73,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._email = user_input["email"]
             self._password = user_input["password"]
 
-            # Login + VINs abrufen (synchroner Client im Executor)
             try:
                 vins = await self.hass.async_add_executor_job(
                     self._login_and_fetch_vins
@@ -101,7 +101,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _login_and_fetch_vins(self) -> list[str]:
         """Synchron: Login + VIN-Liste aus dem Portal abrufen."""
-        # Temporärer Client ohne VIN/Identifier nur für Login + VIN-Abfrage
         client = CupraClient(email=self._email, password=self._password, vin="")
         try:
             client.login()
@@ -122,7 +121,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return vins
 
     # ------------------------------------------------------------------
-    # Schritt 2: VIN auswählen
+    # Schritt 2: VIN auswählen (wird immer angezeigt, auch bei einer VIN)
     # ------------------------------------------------------------------
     async def async_step_vin(
         self, user_input: dict[str, Any] | None = None
@@ -132,11 +131,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             selected_vin = user_input[CONF_VIN]
 
-            # Unique-ID-Check: VIN darf nicht bereits konfiguriert sein
             await self.async_set_unique_id(selected_vin)
             self._abort_if_unique_id_configured()
 
-            # Identifier automatisch aus dem Portal auslesen
             try:
                 identifier = await self.hass.async_add_executor_job(
                     self._fetch_identifier_for_vin, selected_vin
@@ -151,16 +148,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     prefill={CONF_VIN: selected_vin, CONF_REQUEST_IDENTIFIER: identifier}
                 )
 
-        # Dropdown-Auswahl: bei einer VIN direkt vorausfüllen
-        if len(self._available_vins) == 1:
-            default_vin = self._available_vins[0]
-        else:
-            default_vin = vol.UNDEFINED
-
+        # Dropdown immer anzeigen - auch bei nur einer VIN, damit der Schritt
+        # sichtbar und testbar ist. Bei einer VIN ist sie die einzige Option.
         return self.async_show_form(
             step_id="vin",
             data_schema=vol.Schema({
-                vol.Required(CONF_VIN, default=default_vin): vol.In(self._available_vins),
+                vol.Required(CONF_VIN): vol.In(self._available_vins),
             }),
             errors=errors,
         )
@@ -184,7 +177,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         prefill: dict[str, Any] | None = None,
     ) -> FlowResult:
         if prefill:
-            # Erste Anzeige des Formulars mit vorausgefüllten Werten
             self._prefill = prefill
             return self.async_show_form(
                 step_id="settings",
@@ -212,7 +204,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data=data,
             )
 
-        # Fallback falls direkt aufgerufen ohne prefill
         return self.async_show_form(
             step_id="settings",
             data_schema=vol.Schema({
