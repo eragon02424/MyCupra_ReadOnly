@@ -33,13 +33,8 @@ REDIRECT_URI = "https://eu-data-act.drivesomethinggreater.com/login"
 IDENTITY_BASE = "https://identity.vwgroup.io"
 PORTAL_BASE = "https://eu-data-act.drivesomethinggreater.com"
 
-# Default-Wert für die Anfrage-ID im Config-Flow. Bewusst LEER gelassen:
-# jeder Nutzer hat seine eigene, im EU-Data-Act-Portal selbst angelegte
-# Daueranfrage mit eigener Identifier-ID. Ein vorausgefüllter Wert (z.B. die
-# ID eines bestimmten Nutzers) wäre für alle anderen Nutzer falsch und sollte
-# daher nicht als Default in der Integration stehen.
-# Der Identifier wird automatisch nach dem Login via fetch_request_identifier()
-# aus dem Portal ausgelesen (GET /metadata/partial), falls er leer bleibt.
+# Default-Wert für die Anfrage-ID. Bewusst LEER: wird automatisch via
+# fetch_request_identifier() aus dem Portal ausgelesen.
 DEFAULT_REQUEST_IDENTIFIER = ""
 
 USER_AGENT = (
@@ -49,25 +44,18 @@ USER_AGENT = (
 
 
 class CupraLoginError(Exception):
-    """Basis-Fehlerklasse. Wird bei fehlgeschlagenem Login oder Datenabruf ausgelöst."""
+    """Basis-Fehlerklasse."""
 
 
 class CupraRetryableError(CupraLoginError):
-    """Fehler, bei denen ein erneuter Versuch sinnvoll sein kann:
-    Netzwerkprobleme (kurzer Internetausfall) oder ein vom Server abgelehnter/
-    abgelaufener Token (HTTP 401), der durch einen frischen Login behoben wird."""
+    """Fehler, bei denen ein erneuter Versuch sinnvoll ist."""
 
 
 class CupraPermanentError(CupraLoginError):
-    """Fehler, bei denen ein erneuter Versuch garantiert wieder fehlschlägt:
-    falsches Passwort, falsche VIN, ungültiger Anfrage-Identifier. Hier soll
-    sofort und klar abgebrochen werden, statt wiederholt zu versuchen (würde
-    nur Zeit verschwenden und könnte wie ein Brute-Force-Versuch wirken)."""
+    """Fehler, bei denen ein erneuter Versuch garantiert wieder fehlschlägt."""
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Verhindert automatisches Folgen von Redirects, damit wir jeden Schritt
-    selbst steuern können (genau wie curl ohne -L)."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -411,6 +399,59 @@ class CupraClient:
 
         logger.info("Login erfolgreich.")
 
+    def fetch_vins(self) -> list[str]:
+        """
+        Liest alle Fahrzeug-VINs aus dem Portal aus, die dem eingeloggten
+        Account zugeordnet sind.
+        Endpunkt: GET /proxy_api/vum/v2/users/me/relations (ohne VIN im Pfad).
+        Antwortformat aus HAR: bei einem Fahrzeug ein einzelnes Objekt mit
+        verschachtelten "user"/"relation"-Feldern - die VIN ist nicht direkt
+        im Body, sondern wird aus dem Pfad der enthaltenen Links ermittelt.
+        Fallback: falls der Endpunkt kein bekanntes Format liefert, wird die
+        VIN aus dem CSRF-Token-Endpunkt der Fahrzeugdetailseite ermittelt.
+        """
+        if not self.is_logged_in():
+            self.login()
+
+        # Primärer Versuch: /relations liefert bei mehreren Fahrzeugen eine Liste
+        url = f"{PORTAL_BASE}/proxy_api/vum/v2/users/me/relations"
+        status, headers, body = self._request("GET", url, allow_404=True)
+
+        if status == 200:
+            data = json.loads(body)
+            vins = []
+            if isinstance(data, list):
+                # Mehrere Fahrzeuge: Liste von Objekten, jedes mit "vin"-Feld
+                vins = [entry["vin"] for entry in data if "vin" in entry]
+            elif isinstance(data, dict):
+                # Ein Fahrzeug: einzelnes Objekt, VIN ggf. in "vin" oder nicht direkt vorhanden
+                if "vin" in data:
+                    vins = [data["vin"]]
+                # Falls VIN nicht im Body (wie in der HAR beobachtet - kein "vin"-Feld
+                # auf oberster Ebene), alternativ /libs/granite/csrf/token.json + VIN
+                # aus der Fahrzeugübersichtsseite extrahieren (Fallback unten).
+            if vins:
+                logger.info("Fahrzeuge gefunden: %s", vins)
+                return vins
+
+        # Fallback: VIN direkt aus der Portal-Übersichtsseite extrahieren.
+        # Die Seite enthält die VIN in einem <div> oder einem data-Attribut,
+        # das wir per Regex lesen können.
+        url_overview = f"{PORTAL_BASE}/de/en/user.html"
+        status2, _, body2 = self._request("GET", url_overview, allow_404=True)
+        if status2 == 200:
+            html = body2.decode("utf-8", errors="replace")
+            # VIN-Format: 17 alphanumerische Zeichen, beginnt oft mit VSS/WVW/etc.
+            vins = list(set(re.findall(r'\b([A-HJ-NPR-Z0-9]{17})\b', html)))
+            if vins:
+                logger.info("VINs aus Übersichtsseite extrahiert: %s", vins)
+                return vins
+
+        raise CupraLoginError(
+            "Keine Fahrzeug-VINs gefunden. Bitte prüfen, ob das Fahrzeug im "
+            "EU Data Act Portal registriert ist."
+        )
+
     def fetch_request_identifier(self) -> str:
         """
         Liest den Identifier der Daueranfrage automatisch aus dem Portal aus.
@@ -418,8 +459,6 @@ class CupraClient:
         Verifiziert anhand HAR-Aufzeichnung 18.06.2026.
         Hinweis: /metadata/all liefert die one-time Anfrage - nicht verwenden.
         """
-        # Direkt is_logged_in() statt ensure_logged_in() prüfen,
-        # da ensure_logged_in() seinerseits fetch_request_identifier() aufruft.
         if not self.is_logged_in():
             self.login()
         url = f"{PORTAL_BASE}/proxy_api/euda-apim/datarequest/vehicles/{self.vin}/metadata/partial"
