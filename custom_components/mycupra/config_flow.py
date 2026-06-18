@@ -1,10 +1,9 @@
 """Config Flow für die MyCupra (Read-Only) Integration.
 
 Mehrstufiger Flow:
-  Schritt 1 (user):      E-Mail + Passwort eingeben -> Login validieren
-  Schritt 2 (vin):       VIN manuell eingeben
-  Schritt 3 (settings):  Gerätename + Update-Intervall, Identifier wird
-                         automatisch aus dem Portal ausgelesen
+  Schritt 1 (user):      E-Mail + Passwort -> Login + VINs automatisch auslesen
+  Schritt 2 (vin):       VIN aus Dropdown auswählen -> Identifier automatisch auslesen
+  Schritt 3 (settings):  Gerätename + Update-Intervall
 """
 
 from __future__ import annotations
@@ -38,6 +37,9 @@ class CannotConnect(HomeAssistantError):
 class InvalidAuth(HomeAssistantError):
     pass
 
+class NoVehicles(HomeAssistantError):
+    pass
+
 class NoDataRequest(HomeAssistantError):
     pass
 
@@ -51,9 +53,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._email: str = ""
         self._password: str = ""
         self._client: CupraClient | None = None
+        self._available_vins: list[str] = []
+        self._prefill: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
-    # Schritt 1: E-Mail + Passwort
+    # Schritt 1: E-Mail + Passwort -> Login + VINs auslesen
     # ------------------------------------------------------------------
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -64,15 +68,18 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._email = user_input["email"]
             self._password = user_input["password"]
             try:
-                await self.hass.async_add_executor_job(self._do_login)
+                vins = await self.hass.async_add_executor_job(self._login_and_fetch_vins)
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
+            except NoVehicles:
+                errors["base"] = "no_vehicles"
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Unerwarteter Fehler beim Login")
                 errors["base"] = "unknown"
             else:
+                self._available_vins = vins
                 return await self.async_step_vin()
 
         return self.async_show_form(
@@ -84,7 +91,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    def _do_login(self) -> None:
+    def _login_and_fetch_vins(self) -> list[str]:
         client = CupraClient(email=self._email, password=self._password, vin="")
         try:
             client.login()
@@ -92,10 +99,17 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             raise InvalidAuth from err
         except CupraLoginError as err:
             raise CannotConnect from err
+        try:
+            vins = client.fetch_vins()
+        except CupraLoginError as err:
+            raise CannotConnect from err
+        if not vins:
+            raise NoVehicles
         self._client = client
+        return vins
 
     # ------------------------------------------------------------------
-    # Schritt 2: VIN manuell eingeben
+    # Schritt 2: VIN aus Dropdown auswählen -> Identifier auslesen
     # ------------------------------------------------------------------
     async def async_step_vin(
         self, user_input: dict[str, Any] | None = None
@@ -103,7 +117,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            selected_vin = user_input[CONF_VIN].strip().upper()
+            selected_vin = user_input[CONF_VIN]
 
             await self.async_set_unique_id(selected_vin)
             self._abort_if_unique_id_configured()
@@ -113,7 +127,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._fetch_identifier_for_vin, selected_vin
                 )
             except NoDataRequest:
-                errors[CONF_VIN] = "no_data_request"
+                errors["base"] = "no_data_request"
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Fehler beim Auslesen des Identifiers")
                 errors["base"] = "unknown"
@@ -122,10 +136,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     prefill={CONF_VIN: selected_vin, CONF_REQUEST_IDENTIFIER: identifier}
                 )
 
+        # Dropdown immer anzeigen (auch bei einer VIN - für Testzwecke sichtbar)
         return self.async_show_form(
             step_id="vin",
             data_schema=vol.Schema({
-                vol.Required(CONF_VIN): str,
+                vol.Required(CONF_VIN): vol.In(self._available_vins),
             }),
             errors=errors,
         )
