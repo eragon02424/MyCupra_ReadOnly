@@ -73,6 +73,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
 
         Antwortformat: {"vin": ..., "Data": [{"dataFieldName": ..., "value": ...}, ...]}
         Bei mehrfach vorkommenden Feldnamen wird der erste Wert verwendet.
+
+        VW liefert je nach Fahrzeugzustand unterschiedliche Report-Typen:
+        - battery_state_report.* nur wenn Ladevorgang aktiv oder kurz danach
+        - battery_level_HV.value immer vorhanden
+        - charging_state_report.* nur bei aktivem/kürzlichem Ladevorgang
         """
         result = {"_raw_filename": filename, "_raw_size_bytes": len(raw_bytes)}
 
@@ -105,6 +110,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             except (ValueError, TypeError):
                 return None
 
+        def _float_positive(key: str):
+            """Gibt None zurück wenn Wert <= 0 (VW Sentinel für 'nicht anwendbar')."""
+            v = _float(key)
+            return v if (v is not None and v > 0) else None
+
         def _int(key: str):
             v = fields.get(key)
             try:
@@ -112,19 +122,34 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             except (ValueError, TypeError):
                 return None
 
+        def _seconds_to_minutes_positive(key: str):
+            """Konvertiert '33000s' -> 550 Minuten. None wenn <= 0 (Sentinel)."""
+            v = fields.get(key)
+            if v is None:
+                return None
+            try:
+                minutes = round(int(str(v).rstrip("s")) / 60)
+                return minutes if minutes > 0 else None
+            except (ValueError, TypeError):
+                return None
+
         def _soc_from_energy() -> int | None:
-            """SOC aus Energieinhalten berechnen falls battery_level_HV fehlt."""
+            """Fallback: SOC aus Energieinhalten berechnen."""
             current = _float("energy_contents.current_energy_content.physical_value")
             maximum = _float("energy_contents.maximal_energy_content.physical_value")
             if current is not None and maximum and maximum > 0:
                 return round(current / maximum * 100)
             return None
 
-        # SOC: primär battery_level_HV.value, Fallback auf Energieinhalt-Berechnung
-        soc_raw = _float("battery_level_HV.value")
-        soc = round(soc_raw) if soc_raw is not None else _soc_from_energy()
+        # SOC: primär battery_state_report.soc (ganzzahlig, offizieller Wert)
+        # Fallback 1: battery_level_HV.value (Fließkomma, immer vorhanden)
+        # Fallback 2: Berechnung aus Energieinhalt
+        soc = (
+            _int("battery_state_report.soc")
+            or _int("battery_level_HV.value")
+            or _soc_from_energy()
+        )
 
-        # Energieinhalt in kWh
         current_energy = _float("energy_contents.current_energy_content.physical_value")
         max_energy = _float("energy_contents.maximal_energy_content.physical_value")
 
@@ -133,6 +158,9 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             "soc":                          soc,
             "current_energy_kwh":           round(current_energy / 1000, 2) if current_energy is not None else None,
             "max_energy_kwh":               round(max_energy / 1000, 2) if max_energy is not None else None,
+            "charge_power_kw":              _float("battery_state_report.charge_power"),
+            "charge_rate_km_h":             _float_positive("battery_state_report.charge_rate"),
+            "remaining_charge_min":         _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete"),
             "target_soc":                   _int("settings.target_soc"),
             "battery_care_limit":           _int("battery_care_mode.charge_bcam_threshold"),
             # Fahrzeug
@@ -146,11 +174,13 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             "ascent_consumption":           _float("slope_consumption_values.ascent_slope_consumption.physical_value"),
             "descent_consumption":          _float("slope_consumption_values.descent_slope_consumption.physical_value"),
             # Status (Text)
-            "charge_mode":                  fields.get("settings.charge_mode_selection"),
+            "charge_state":                 fields.get("charging_state_report.current_charge_state"),
+            "charge_type":                  fields.get("charging_state_report.charge_type"),
+            "charge_mode":                  fields.get("charging_state_report.charge_mode"),
             "update_reason":                fields.get("update_reason"),
             # Binary
             "locked":                       fields.get("locked") == "true" if fields.get("locked") is not None else None,
-            # Zeitstempel (neuester car_captured_time Wert)
+            # Zeitstempel
             "car_captured_at":              fields.get("car_captured_utc_timestamp"),
         })
 
