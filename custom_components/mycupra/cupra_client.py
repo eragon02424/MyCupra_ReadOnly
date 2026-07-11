@@ -161,12 +161,18 @@ class CupraClient:
         while guard < 5:
             guard += 1
             fields = self._extract_marketing_consent_fields(html)
+            logger.debug("Consent-Durchlauf %d: extrahierte Felder: %s", guard, list(fields.keys()))
             missing = [k for k in ("_csrf", "documentKey", "relayState", "hmac",
                                     "countryOfJurisdiction", "language", "callback")
                        if k not in fields]
             if missing:
+                logger.error(
+                    "Consent-Durchlauf %d: Felder fehlen: %s. HTML-Ausschnitt (erste 500 Zeichen): %s",
+                    guard, missing, html[:500]
+                )
                 raise CupraLoginError(f"Consent-Schritt {guard}: Felder fehlen: {missing}")
             logger.info("Marketing-Consent (Durchlauf %d, %s) - lehne ab.", guard, fields["documentKey"])
+            logger.debug("Consent-Durchlauf %d: POST an %s", guard, url)
             status, headers, body = self._request("POST", url, data={
                 "_csrf": fields["_csrf"], "documentKey": fields["documentKey"],
                 "relayState": fields["relayState"], "hmac": fields["hmac"],
@@ -179,16 +185,25 @@ class CupraClient:
                 "channelapp": fields.get("channelapp", "false"),
                 "channelsms": fields.get("channelsms", "false"),
             })
+            logger.debug("Consent-Durchlauf %d: HTTP %s", guard, status)
             if status == 302:
+                logger.info("Consent-Durchlauf %d: abgeschlossen, Weiterleitung zu %s", guard, headers.get("Location"))
                 return headers["Location"]
             if status == 200:
                 html = body.decode("utf-8", errors="replace")
                 nf = self._extract_marketing_consent_fields(html)
                 ns = nf.get("step")
                 if not ns:
+                    logger.error(
+                        "Consent-Durchlauf %d: 'step' nicht im HTML gefunden. Ausschnitt: %s",
+                        guard, html[:500]
+                    )
                     raise CupraLoginError(f"Consent {guard}: 'step' nicht gefunden.")
+                logger.info("Consent-Durchlauf %d: weiterer Consent-Screen (Index %s) erkannt.", guard, ns)
                 url = re.sub(r'/\d+/skip$', f'/{ns}/skip', url)
                 continue
+            logger.error("Consent-Durchlauf %d: unerwarteter Status %s. Body-Ausschnitt: %s",
+                         guard, status, body[:300])
             raise CupraLoginError(f"Unerwarteter Status {status} bei Consent {guard}.")
         raise CupraLoginError("Consent-Schleife nach 5 Durchläufen nicht beendet.")
 
@@ -247,13 +262,17 @@ class CupraClient:
                   "state": STATE, "redirect_uri": REDIRECT_URI, "prompt": "login"}
         url = f"{IDENTITY_BASE}/oidc/v1/authorize?{urllib.parse.urlencode(params)}"
         status, headers, _ = self._request("GET", url)
+        logger.debug("1/9 GET %s -> HTTP %s", url, status)
         if status != 302:
             raise CupraLoginError(f"Authorize fehlgeschlagen: HTTP {status}")
         signin_url = headers["Location"]
+        logger.debug("1/9 Location: %s", signin_url)
 
         logger.info("Schritt 2/9: Signin-Seite laden")
         status, headers, body = self._request("GET", signin_url)
+        logger.debug("2/9 GET %s -> HTTP %s (%d Bytes)", signin_url, status, len(body))
         fields = self._extract_hidden_inputs(body.decode("utf-8"))
+        logger.debug("2/9 Extrahierte Felder: %s", list(fields.keys()))
         if not fields.get("_csrf"):
             raise CupraLoginError("CSRF nicht extrahierbar (Signin).")
 
@@ -263,13 +282,17 @@ class CupraClient:
             "_csrf": fields["_csrf"], "relayState": fields["relayState"],
             "hmac": fields["hmac"], "email": self.email,
         })
+        logger.debug("3/9 POST %s -> HTTP %s", post_url, status)
         if status != 303:
             raise CupraLoginError(f"E-Mail-Schritt fehlgeschlagen: HTTP {status}")
         authenticate_url = IDENTITY_BASE + headers["Location"]
+        logger.debug("3/9 Location: %s", authenticate_url)
 
         logger.info("Schritt 4/9: Passwort-Seite laden")
         status, headers, body = self._request("GET", authenticate_url)
+        logger.debug("4/9 GET %s -> HTTP %s (%d Bytes)", authenticate_url, status, len(body))
         pw_fields = self._extract_js_model_fields(body.decode("utf-8"))
+        logger.debug("4/9 Extrahierte Felder: %s", list(pw_fields.keys()))
         if not pw_fields.get("_csrf"):
             raise CupraLoginError("CSRF nicht extrahierbar (Passwort).")
 
@@ -278,8 +301,10 @@ class CupraClient:
             "_csrf": pw_fields["_csrf"], "relayState": pw_fields["relayState"],
             "hmac": pw_fields["hmac"], "email": self.email, "password": self.password,
         })
+        logger.debug("5/9 POST %s -> HTTP %s", authenticate_url.split("?")[0], status)
         if status == 303:
             loc = headers.get("Location", "")
+            logger.debug("5/9 303-Location: %s", loc)
             if "error=" in loc:
                 m = re.search(r"error=([\w.]+)", loc)
                 raise CupraPermanentError(f"Login abgelehnt: {m.group(1) if m else 'unbekannt'}")
@@ -287,38 +312,53 @@ class CupraClient:
         if status != 302:
             raise CupraLoginError(f"Passwort-Schritt fehlgeschlagen: HTTP {status}")
         sso_url = headers["Location"]
+        logger.debug("5/9 Location: %s", sso_url)
 
         logger.info("Schritt 6/9: SSO-Redirect folgen")
         status, headers, body = self._request("GET", sso_url)
+        logger.debug("6/9 GET %s -> HTTP %s (%d Bytes)", sso_url, status, len(body))
         if status == 200 and "/consent/marketing/" in sso_url:
+            logger.info("6/9 Marketing-Consent-Screen erkannt bei SSO-Schritt - lehne ab.")
             consent_url = self._handle_marketing_consent_if_present(sso_url, body)
+            logger.debug("6/9 Nach Consent-Skip -> %s", consent_url)
         elif status != 302:
             raise CupraLoginError(f"SSO-Schritt fehlgeschlagen: HTTP {status}")
         else:
             consent_url = headers["Location"]
+            logger.debug("6/9 Location: %s", consent_url)
 
         logger.info("Schritt 7/9: Consent-Redirect folgen")
         status, headers, body = self._request("GET", consent_url)
+        logger.debug("7/9 GET %s -> HTTP %s (%d Bytes)", consent_url, status, len(body))
         if status == 200 and "/consent/marketing/" in consent_url:
+            logger.info("7/9 Marketing-Consent-Screen erkannt - lehne ab.")
             callback_success_url = self._handle_marketing_consent_if_present(consent_url, body)
+            logger.debug("7/9 Nach Consent-Skip -> %s", callback_success_url)
         elif status != 302:
             raise CupraLoginError(f"Consent-Schritt fehlgeschlagen: HTTP {status}")
         else:
             callback_success_url = headers["Location"]
+            logger.debug("7/9 Location: %s", callback_success_url)
 
         logger.info("Schritt 8/9: Callback/success -> Authorization Code")
         status, headers, _ = self._request("GET", callback_success_url)
+        logger.debug("8/9 GET %s -> HTTP %s", callback_success_url, status)
         if status != 302:
             raise CupraLoginError(f"Callback fehlgeschlagen: HTTP {status}")
         portal_login_url = headers["Location"]
+        logger.debug("8/9 Location: %s", portal_login_url)
 
         logger.info("Schritt 9/9: Code beim Portal einlösen")
         status, headers, _ = self._request("GET", portal_login_url)
+        logger.debug("9/9 GET %s -> HTTP %s", portal_login_url, status)
         if status != 302:
             raise CupraLoginError(f"Portal-Login fehlgeschlagen: HTTP {status}")
-        status, headers, _ = self._request("GET", headers["Location"])
+        callback_login_url = headers["Location"]
+        status, headers, _ = self._request("GET", callback_login_url)
+        logger.debug("9/9 GET %s -> HTTP %s", callback_login_url, status)
         if status != 302:
             raise CupraLoginError(f"Portal-Callback fehlgeschlagen: HTTP {status}")
+        logger.debug("9/9 Finale Location: %s", headers.get("Location"))
 
         if not self._get_cookie("access_token"):
             raise CupraLoginError("Kein access_token nach Login erhalten.")
