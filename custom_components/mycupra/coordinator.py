@@ -150,14 +150,16 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             or _soc_from_energy()
         )
 
+        # Rohwert von energy_contents.*.physical_value ist in Zehntel-kWh
+        # (z.B. 773.5 == 77,35 kWh, passend zur Netto-Kapazität des Tavascan-Akkus).
         current_energy = _float("energy_contents.current_energy_content.physical_value")
         max_energy = _float("energy_contents.maximal_energy_content.physical_value")
 
         result.update({
             # Batterie
             "soc":                          soc,
-            "current_energy_kwh":           round(current_energy / 1000, 2) if current_energy is not None else None,
-            "max_energy_kwh":               round(max_energy / 1000, 2) if max_energy is not None else None,
+            "current_energy_kwh":           round(current_energy / 10, 2) if current_energy is not None else None,
+            "max_energy_kwh":               round(max_energy / 10, 2) if max_energy is not None else None,
             "charge_power_kw":              _float("battery_state_report.charge_power"),
             "charge_rate_km_h":             _float_positive("battery_state_report.charge_rate"),
             "remaining_charge_min":         _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete"),
