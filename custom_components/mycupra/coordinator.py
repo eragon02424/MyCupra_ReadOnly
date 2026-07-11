@@ -141,12 +141,14 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
                 return round(current / maximum * 100)
             return None
 
-        # SOC: primär battery_state_report.soc (ganzzahlig, offizieller Wert)
-        # Fallback 1: battery_level_HV.value (Fließkomma, immer vorhanden)
+        # SOC: primär battery_level_HV.value (entspricht dem in der SEAT/CUPRA-App
+        # angezeigten Ladezustand, verifiziert 11.07.2026 - immer vorhanden)
+        # Fallback 1: battery_state_report.soc (nur bei/kurz nach Ladevorgang vorhanden,
+        # weicht vom App-Wert ab)
         # Fallback 2: Berechnung aus Energieinhalt
         soc = (
-            _int("battery_state_report.soc")
-            or _int("battery_level_HV.value")
+            _int("battery_level_HV.value")
+            or _int("battery_state_report.soc")
             or _soc_from_energy()
         )
 
