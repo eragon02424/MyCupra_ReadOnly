@@ -25,7 +25,6 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
@@ -205,11 +204,11 @@ async def async_setup_entry(
     )
 
 
-class MyCupraSensor(CoordinatorEntity[MyCupraCoordinator], SensorEntity, RestoreEntity):
-    """Einzelner Sensor mit Restore-Unterstützung nach HA-Neustart.
+class MyCupraSensor(CoordinatorEntity[MyCupraCoordinator], SensorEntity):
+    """Einzelner Sensor, der seinen Wert aus coordinator.data[key] liest.
 
-    RestoreEntity sorgt dafür, dass der letzte bekannte Wert beim Neustart
-    sofort verfügbar ist, bevor die erste echte Aktualisierung kommt.
+    Der Coordinator hält den letzten bekannten Stand pro Feld selbst (persistent in
+    .storage), deshalb ist keine RestoreEntity-Logik mehr nötig.
     """
 
     def __init__(
@@ -226,21 +225,9 @@ class MyCupraSensor(CoordinatorEntity[MyCupraCoordinator], SensorEntity, Restore
             manufacturer="Cupra",
             model="Tavascan",
         )
-        self._restored_value: Any = None
-
-    async def async_added_to_hass(self) -> None:
-        """Beim Start: letzten gespeicherten Wert wiederherstellen."""
-        await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
-            if last_state.state not in ("unavailable", "unknown"):
-                self._restored_value = last_state.state
 
     @property
     def native_value(self) -> Any:
-        """Aktueller Wert aus dem Coordinator, Fallback auf letzten Wert nach Neustart."""
-        if self.coordinator.data is not None:
-            val = self.coordinator.data.get(self.entity_description.key)
-            if val is not None:
-                return val
-        # Fallback: wiederhergestellter Wert nach Neustart, bis erste Aktualisierung kommt
-        return self._restored_value
+        if self.coordinator.data is None:
+            return None
+        return self.coordinator.data.get(self.entity_description.key)
