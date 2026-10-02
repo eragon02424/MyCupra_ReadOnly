@@ -1,15 +1,23 @@
-"""DataUpdateCoordinator für die MyCupra (Read-Only) Integration."""
+"""DataUpdateCoordinator für die MyCupra (Read-Only) Integration.
+
+Ablauf pro Aktualisierung (alle 15 min):
+1. Dateiliste vom Portal holen (das Portal hält nur die letzten ~30 Dateien vor).
+2. Alle noch nicht verarbeiteten Dateien mit Inhalt herunterladen und auswerten.
+   Leere Dateien ("no_content_found") werden übersprungen.
+3. Pro Feld gewinnt der Wert aus der NEUESTEN Datei, in der das Feld vorkommt.
+4. Der Stand (Feldwerte + verarbeitete Dateien) wird in .storage gesichert, damit er
+   einen HA-Neustart und das Herausfallen alter Dateien aus der Portal-Liste übersteht.
+"""
 
 from __future__ import annotations
 
-import io
-import json
 import logging
-import zipfile
 from datetime import timedelta
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -21,12 +29,18 @@ from .const import (
     DOMAIN,
 )
 from .cupra_client import CupraClient, CupraLoginError, CupraPermanentError
+from .parsing import build_result, extract_fields, is_empty_file, merge_fields
 
 _LOGGER = logging.getLogger(__name__)
 
+STORAGE_VERSION = 1
+
+# Werte, deren Änderung als INFO ins Log geschrieben wird.
+_LOGGED_KEYS = ("soc", "mileage_km", "charge_state", "locked", "car_captured_at")
+
 
 class MyCupraCoordinator(DataUpdateCoordinator[dict]):
-    """Holt periodisch die neueste Datendatei vom EU Data Act Portal."""
+    """Holt periodisch neue Datendateien vom EU Data Act Portal und führt sie zusammen."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
@@ -51,141 +65,145 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             update_interval=timedelta(minutes=update_interval_minutes),
         )
 
+        self._store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}_{self.vin}_state")
+        # Feldname -> Wert / Zeitstempel (createdOn) der Datei, aus der der Wert stammt
+        self._fields: dict[str, str] = {}
+        self._field_ts: dict[str, str] = {}
+        # Bereits verarbeitete Dateien: Dateiname -> createdOn
+        self._seen: dict[str, str] = {}
+        self._last_data_file: str | None = None
+        self._last_data_file_ts: str | None = None
+        self._last_data_file_size: int | None = None
+
+    async def _async_setup(self) -> None:
+        """Gespeicherten Stand laden (wird vor dem ersten Abruf aufgerufen)."""
+        stored = await self._store.async_load()
+        if not stored:
+            _LOGGER.info("Kein gespeicherter Stand vorhanden - starte mit leerem Zwischenspeicher.")
+            return
+        self._fields = dict(stored.get("fields", {}))
+        self._field_ts = dict(stored.get("field_ts", {}))
+        self._seen = dict(stored.get("seen", {}))
+        self._last_data_file = stored.get("last_data_file")
+        self._last_data_file_ts = stored.get("last_data_file_ts")
+        self._last_data_file_size = stored.get("last_data_file_size")
+        _LOGGER.info(
+            "Gespeicherter Stand geladen: %d Felder, %d bekannte Dateien, letzte Datendatei %s",
+            len(self._fields), len(self._seen), self._last_data_file,
+        )
+
+    async def _async_save(self) -> None:
+        await self._store.async_save(
+            {
+                "fields": self._fields,
+                "field_ts": self._field_ts,
+                "seen": self._seen,
+                "last_data_file": self._last_data_file,
+                "last_data_file_ts": self._last_data_file_ts,
+                "last_data_file_size": self._last_data_file_size,
+            }
+        )
+
     async def _async_update_data(self) -> dict:
+        _LOGGER.debug("Aktualisierung gestartet")
         try:
-            raw_bytes, filename = await self.hass.async_add_executor_job(
-                self.client.download_latest
-            )
+            files = await self.hass.async_add_executor_job(self.client.list_files)
         except CupraPermanentError as err:
+            _LOGGER.error("Dauerhafter Fehler bei der Dateiliste: %s", err)
             raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
         except CupraLoginError as err:
+            _LOGGER.warning("Dateiliste nicht abrufbar: %s", err)
             raise UpdateFailed(f"Datenabruf fehlgeschlagen: {err}") from err
 
-        parsed = await self.hass.async_add_executor_job(
-            self._parse_zip, raw_bytes, filename
+        files = sorted(files, key=lambda f: f.get("createdOn", ""))
+        empty = [f for f in files if is_empty_file(f)]
+        with_data = [f for f in files if not is_empty_file(f)]
+        new_files = [f for f in files if f["name"] not in self._seen]
+        new_data = [f for f in new_files if not is_empty_file(f)]
+        _LOGGER.info(
+            "Dateiliste: %d Dateien (%d mit Daten, %d leer), %d neu, davon %d mit Daten. "
+            "Neueste Datei: %s",
+            len(files), len(with_data), len(empty), len(new_files), len(new_data),
+            files[-1]["name"] if files else "-",
         )
-        _LOGGER.debug("Geparste Felder: %s", list(parsed.keys()))
-        return parsed
+        if not files:
+            _LOGGER.warning("Das Portal liefert keine Dateien - Daueranfrage im Portal prüfen.")
 
-    @staticmethod
-    def _parse_zip(raw_bytes: bytes, filename: str) -> dict:
-        """Entpackt die ZIP und wertet die JSON-Datei aus.
+        previous = dict(self.data) if self.data else build_result(self._fields)
+        state_changed = False
 
-        Antwortformat: {"vin": ..., "Data": [{"dataFieldName": ..., "value": ...}, ...]}
-        Bei mehrfach vorkommenden Feldnamen wird der erste Wert verwendet.
+        # Älteste zuerst; merge_fields sorgt dafür, dass pro Feld immer die neueste Datei gewinnt.
+        for entry in new_data:
+            name = entry["name"]
+            created = entry.get("createdOn", "")
+            try:
+                raw = await self.hass.async_add_executor_job(self.client.download_file, name)
+            except CupraPermanentError as err:
+                _LOGGER.error("Dauerhafter Fehler beim Download von %s: %s", name, err)
+                raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
+            except CupraLoginError as err:
+                # Nicht als gesehen markieren, damit der nächste Lauf es erneut versucht.
+                _LOGGER.warning("Download von %s fehlgeschlagen, nächster Lauf versucht es erneut: %s", name, err)
+                continue
 
-        VW liefert je nach Fahrzeugzustand unterschiedliche Report-Typen:
-        - battery_state_report.* nur wenn Ladevorgang aktiv oder kurz danach
-        - battery_level_HV.value immer vorhanden
-        - charging_state_report.* nur bei aktivem/kürzlichem Ladevorgang
-        """
-        result = {"_raw_filename": filename, "_raw_size_bytes": len(raw_bytes)}
+            fields = await self.hass.async_add_executor_job(extract_fields, raw, name)
+            if fields is None:
+                _LOGGER.error("Datei %s nicht auswertbar - wird übersprungen und nicht erneut versucht.", name)
+                self._seen[name] = created
+                state_changed = True
+                continue
 
-        try:
-            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
-                json_name = next(
-                    (n for n in zf.namelist() if n.endswith(".json")), None
+            changed = merge_fields(self._fields, self._field_ts, fields, created)
+            self._seen[name] = created
+            if not self._last_data_file_ts or created >= self._last_data_file_ts:
+                self._last_data_file = name
+                self._last_data_file_ts = created
+                self._last_data_file_size = len(raw)
+            state_changed = True
+            _LOGGER.info(
+                "Datei %s (%s, %d Bytes) ausgewertet: %d Felder, %d davon neu oder geändert.",
+                name, created, len(raw), len(fields), changed,
+            )
+
+        # Leere Dateien nur als gesehen vermerken.
+        for entry in new_files:
+            if is_empty_file(entry) and entry["name"] not in self._seen:
+                self._seen[entry["name"]] = entry.get("createdOn", "")
+                state_changed = True
+
+        # Liste der gesehenen Dateien auf die aktuell im Portal vorhandenen begrenzen.
+        current_names = {f["name"] for f in files}
+        pruned = {n: c for n, c in self._seen.items() if n in current_names}
+        if len(pruned) != len(self._seen):
+            _LOGGER.debug("Gesehene Dateien bereinigt: %d -> %d", len(self._seen), len(pruned))
+            self._seen = pruned
+            state_changed = True
+
+        if state_changed:
+            await self._async_save()
+
+        if not new_data:
+            if self._fields:
+                _LOGGER.info(
+                    "Keine neuen Daten im Portal - behalte letzten Stand (letzte Datendatei: %s).",
+                    self._last_data_file,
                 )
-                if not json_name:
-                    _LOGGER.warning("Keine JSON-Datei in ZIP %s gefunden.", filename)
-                    return result
-                data = json.loads(zf.read(json_name))
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Fehler beim Entpacken/Parsen von %s: %s", filename, err)
-            return result
+            else:
+                _LOGGER.warning(
+                    "Keine Daten vorhanden: weder gespeicherter Stand noch Datendatei in der Portal-Liste. "
+                    "Sensoren bleiben leer, bis das Fahrzeug Daten sendet."
+                )
 
-        fields: dict[str, str] = {}
-        for entry in data.get("Data", []):
-            name = entry.get("dataFieldName", "")
-            if name and name not in fields:
-                fields[name] = entry.get("value", "")
+        result: dict[str, Any] = build_result(self._fields)
+        result["_raw_filename"] = self._last_data_file
+        result["_raw_size_bytes"] = self._last_data_file_size
 
-        _LOGGER.debug("ZIP %s: %d eindeutige Felder", filename, len(fields))
+        for key in _LOGGED_KEYS:
+            if previous.get(key) != result.get(key):
+                _LOGGER.info("Wert geändert: %s: %s -> %s", key, previous.get(key), result.get(key))
 
-        # --- Hilfsfunktionen ---
-        def _float(key: str):
-            v = fields.get(key)
-            try:
-                return float(v) if v is not None else None
-            except (ValueError, TypeError):
-                return None
-
-        def _float_positive(key: str):
-            """Gibt None zurück wenn Wert <= 0 (VW Sentinel für 'nicht anwendbar')."""
-            v = _float(key)
-            return v if (v is not None and v > 0) else None
-
-        def _int(key: str):
-            v = fields.get(key)
-            try:
-                return int(float(v)) if v is not None else None
-            except (ValueError, TypeError):
-                return None
-
-        def _seconds_to_minutes_positive(key: str):
-            """Konvertiert '33000s' -> 550 Minuten. None wenn <= 0 (Sentinel)."""
-            v = fields.get(key)
-            if v is None:
-                return None
-            try:
-                minutes = round(int(str(v).rstrip("s")) / 60)
-                return minutes if minutes > 0 else None
-            except (ValueError, TypeError):
-                return None
-
-        def _soc_from_energy() -> int | None:
-            """Fallback: SOC aus Energieinhalten berechnen."""
-            current = _float("energy_contents.current_energy_content.physical_value")
-            maximum = _float("energy_contents.maximal_energy_content.physical_value")
-            if current is not None and maximum and maximum > 0:
-                return round(current / maximum * 100)
-            return None
-
-        # SOC: primär battery_level_HV.value (entspricht dem in der SEAT/CUPRA-App
-        # angezeigten Ladezustand, verifiziert 11.07.2026 - immer vorhanden)
-        # Fallback 1: battery_state_report.soc (nur bei/kurz nach Ladevorgang vorhanden,
-        # weicht vom App-Wert ab)
-        # Fallback 2: Berechnung aus Energieinhalt
-        soc = (
-            _int("battery_level_HV.value")
-            or _int("battery_state_report.soc")
-            or _soc_from_energy()
+        _LOGGER.debug(
+            "Aktualisierung beendet: %d Felder gespeichert, soc=%s, mileage_km=%s",
+            len(self._fields), result.get("soc"), result.get("mileage_km"),
         )
-
-        # Rohwert von energy_contents.*.physical_value ist in Zehntel-kWh
-        # (z.B. 773.5 == 77,35 kWh, passend zur Netto-Kapazität des Tavascan-Akkus).
-        current_energy = _float("energy_contents.current_energy_content.physical_value")
-        max_energy = _float("energy_contents.maximal_energy_content.physical_value")
-
-        result.update({
-            # Batterie
-            "soc":                          soc,
-            "current_energy_kwh":           round(current_energy / 10, 2) if current_energy is not None else None,
-            "max_energy_kwh":               round(max_energy / 10, 2) if max_energy is not None else None,
-            "charge_power_kw":              _float("battery_state_report.charge_power"),
-            "charge_rate_km_h":             _float_positive("battery_state_report.charge_rate"),
-            "remaining_charge_min":         _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete"),
-            "target_soc":                   _int("settings.target_soc"),
-            "battery_care_limit":           _int("battery_care_mode.charge_bcam_threshold"),
-            # Fahrzeug
-            "mileage_km":                   _int("mileage.value"),
-            "outdoor_temperature":          _float("outdoor_temperature"),
-            "min_temperature":              _float("min_temperature"),
-            "max_temperature":              _float("max_temperature"),
-            # Verbrauch
-            "climatization_consumption":    _float("additional_consumptions.interior_climatization_consumption"),
-            "residual_consumption":         _float("additional_consumptions.residual_consumption"),
-            "ascent_consumption":           _float("slope_consumption_values.ascent_slope_consumption.physical_value"),
-            "descent_consumption":          _float("slope_consumption_values.descent_slope_consumption.physical_value"),
-            # Status (Text)
-            "charge_state":                 fields.get("charging_state_report.current_charge_state"),
-            "charge_type":                  fields.get("charging_state_report.charge_type"),
-            "charge_mode":                  fields.get("charging_state_report.charge_mode"),
-            "update_reason":                fields.get("update_reason"),
-            # Binary
-            "locked":                       fields.get("locked") == "true" if fields.get("locked") is not None else None,
-            # Zeitstempel
-            "car_captured_at":              fields.get("car_captured_utc_timestamp"),
-        })
-
         return result
