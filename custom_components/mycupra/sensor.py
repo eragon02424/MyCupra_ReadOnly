@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -15,6 +14,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
+    EntityCategory,
     UnitOfEnergy,
     UnitOfLength,
     UnitOfPower,
@@ -36,159 +36,57 @@ class MyCupraSensorDescription(SensorEntityDescription):
     """Erweiterte SensorEntityDescription mit optionalem Icon."""
 
 
+_M = SensorStateClass.MEASUREMENT
+_DIAG = EntityCategory.DIAGNOSTIC
+_KWH = UnitOfEnergy.KILO_WATT_HOUR
+
+
+def _d(key, name, icon, unit=None, dc=None, sc=None, cat=None, enabled=True):
+    return MyCupraSensorDescription(
+        key=key, name=name, icon=icon, native_unit_of_measurement=unit,
+        device_class=dc, state_class=sc, entity_category=cat,
+        entity_registry_enabled_default=enabled,
+    )
+
+
 SENSOR_DESCRIPTIONS: tuple[MyCupraSensorDescription, ...] = (
     # --- Batterie ---
-    MyCupraSensorDescription(
-        key="soc",
-        name="Akkustand",
-        native_unit_of_measurement=PERCENTAGE,
-        device_class=SensorDeviceClass.BATTERY,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:battery-charging",
-    ),
-    MyCupraSensorDescription(
-        key="charge_power_kw",
-        name="Ladeleistung",
-        native_unit_of_measurement=UnitOfPower.KILO_WATT,
-        device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:flash",
-    ),
-    MyCupraSensorDescription(
-        key="charge_rate_km_h",
-        name="Laderate",
-        native_unit_of_measurement=UnitOfSpeed.KILOMETERS_PER_HOUR,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:speedometer",
-    ),
-    MyCupraSensorDescription(
-        key="remaining_charge_min",
-        name="Ladezeit verbleibend",
-        native_unit_of_measurement=UnitOfTime.MINUTES,
-        device_class=SensorDeviceClass.DURATION,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:timer-outline",
-    ),
-    MyCupraSensorDescription(
-        key="target_soc",
-        name="Ziel-Ladestand",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:battery-charging-100",
-    ),
-    MyCupraSensorDescription(
-        key="battery_care_limit",
-        name="Battery Care Limit",
-        native_unit_of_measurement=PERCENTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:battery-heart",
-    ),
+    _d("soc", "Akkustand", "mdi:battery-charging", PERCENTAGE, SensorDeviceClass.BATTERY, _M),
+    _d("range_km", "Reichweite", "mdi:map-marker-distance", UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE, _M),
+    _d("current_energy_kwh", "Akkuenergie", "mdi:battery-high", _KWH, SensorDeviceClass.ENERGY_STORAGE, _M),
+    _d("max_energy_kwh", "Nutzbare Batteriekapazität", "mdi:battery-plus", _KWH, SensorDeviceClass.ENERGY_STORAGE, _M, _DIAG),
+    _d("last_charge_energy_kwh", "Letzte Ladung (ca.)", "mdi:ev-plug-type2", _KWH, None, None),
+    _d("charge_power_kw", "Ladeleistung", "mdi:flash", UnitOfPower.KILO_WATT, SensorDeviceClass.POWER, _M),
+    _d("charge_rate_km_h", "Laderate", "mdi:speedometer", UnitOfSpeed.KILOMETERS_PER_HOUR, None, _M),
+    _d("remaining_charge_min", "Ladezeit verbleibend", "mdi:timer-outline", UnitOfTime.MINUTES, SensorDeviceClass.DURATION, _M),
+    _d("target_soc", "Ziel-Ladestand", "mdi:battery-charging-100", PERCENTAGE, None, _M),
+    _d("battery_care_limit", "Battery Care Limit", "mdi:battery-heart", PERCENTAGE, None, _M),
     # --- Fahrzeug ---
-    MyCupraSensorDescription(
-        key="mileage_km",
-        name="Kilometerstand",
-        native_unit_of_measurement=UnitOfLength.KILOMETERS,
-        device_class=SensorDeviceClass.DISTANCE,
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        icon="mdi:counter",
-    ),
-    MyCupraSensorDescription(
-        key="outdoor_temperature",
-        name="Außentemperatur",
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:thermometer",
-    ),
-    MyCupraSensorDescription(
-        key="min_temperature",
-        name="Temperatur Min (Klima)",
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:thermometer-low",
-    ),
-    MyCupraSensorDescription(
-        key="max_temperature",
-        name="Temperatur Max (Klima)",
-        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
-        device_class=SensorDeviceClass.TEMPERATURE,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:thermometer-high",
-    ),
+    _d("mileage_km", "Kilometerstand", "mdi:counter", UnitOfLength.KILOMETERS, SensorDeviceClass.DISTANCE, SensorStateClass.TOTAL_INCREASING),
+    _d("outdoor_temperature", "Außentemperatur", "mdi:thermometer", UnitOfTemperature.CELSIUS, SensorDeviceClass.TEMPERATURE, _M),
+    _d("min_temperature", "Temperatur Min (Klima)", "mdi:thermometer-low", UnitOfTemperature.CELSIUS, SensorDeviceClass.TEMPERATURE, _M),
+    _d("max_temperature", "Temperatur Max (Klima)", "mdi:thermometer-high", UnitOfTemperature.CELSIUS, SensorDeviceClass.TEMPERATURE, _M),
     # --- Verbrauch ---
-    MyCupraSensorDescription(
-        key="climatization_consumption",
-        name="Klimaverbrauch",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:air-conditioner",
-    ),
-    MyCupraSensorDescription(
-        key="residual_consumption",
-        name="Ruheverbrauch",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:sleep",
-    ),
-    MyCupraSensorDescription(
-        key="ascent_consumption",
-        name="Steigungsverbrauch",
-        native_unit_of_measurement="Wh/km",
-        state_class=SensorStateClass.MEASUREMENT,
-        icon="mdi:slope-uphill",
-    ),
+    _d("climatization_consumption", "Klimaverbrauch", "mdi:air-conditioner", _KWH, SensorDeviceClass.ENERGY, _M),
+    _d("residual_consumption", "Ruheverbrauch", "mdi:sleep", _KWH, SensorDeviceClass.ENERGY, _M),
+    _d("ascent_consumption", "Steigungsverbrauch", "mdi:slope-uphill", "Wh/km", None, _M),
+    _d("descent_consumption", "Gefälleverbrauch", "mdi:slope-downhill", "Wh/km", None, _M, None, False),
     # --- Status ---
-    MyCupraSensorDescription(
-        key="charge_state",
-        name="Ladestatus",
-        icon="mdi:ev-station",
-    ),
-    MyCupraSensorDescription(
-        key="charge_type",
-        name="Ladetyp",
-        icon="mdi:cable-data",
-    ),
-    MyCupraSensorDescription(
-        key="charge_mode",
-        name="Lademodus",
-        icon="mdi:tune",
-    ),
-    MyCupraSensorDescription(
-        key="update_reason",
-        name="Aktualisierungsgrund",
-        icon="mdi:information-outline",
-        entity_registry_enabled_default=False,
-    ),
+    _d("charge_state", "Ladestatus", "mdi:ev-station"),
+    _d("charge_type", "Ladetyp", "mdi:cable-data"),
+    _d("charge_mode", "Lademodus", "mdi:tune"),
+    _d("update_reason", "Aktualisierungsgrund", "mdi:information-outline", enabled=False),
+    # --- Einstellungen (Diagnose) ---
+    _d("max_charge_current_ac", "Max. Ladestrom AC", "mdi:current-ac", cat=_DIAG),
+    _d("auto_unlock_ac", "Stecker automatisch entriegeln", "mdi:lock-open-variant", cat=_DIAG),
+    _d("charge_mode_selection", "Ladeart (Einstellung)", "mdi:tune-variant", cat=_DIAG),
     # --- Binary ---
-    MyCupraSensorDescription(
-        key="locked",
-        name="Verriegelt",
-        icon="mdi:car-key",
-    ),
+    _d("locked", "Verriegelt", "mdi:car-key"),
     # --- Zeitstempel ---
-    MyCupraSensorDescription(
-        key="car_captured_at",
-        name="Datenstand Fahrzeug",
-        device_class=SensorDeviceClass.TIMESTAMP,
-        icon="mdi:clock-outline",
-    ),
+    _d("car_captured_at", "Datenstand Fahrzeug", "mdi:clock-outline", dc=SensorDeviceClass.TIMESTAMP),
     # --- Rohdaten (deaktiviert) ---
-    MyCupraSensorDescription(
-        key="_raw_filename",
-        name="Letzte Datei",
-        entity_registry_enabled_default=False,
-        icon="mdi:file-outline",
-    ),
-    MyCupraSensorDescription(
-        key="_raw_size_bytes",
-        name="Dateigröße",
-        native_unit_of_measurement="B",
-        entity_registry_enabled_default=False,
-        icon="mdi:file-outline",
-    ),
+    _d("_raw_filename", "Letzte Datei", "mdi:file-outline", enabled=False),
+    _d("_raw_size_bytes", "Dateigröße", "mdi:file-outline", "B", enabled=False),
 )
 
 
