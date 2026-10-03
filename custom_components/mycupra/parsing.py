@@ -133,7 +133,7 @@ def merge_fields(
 
 
 _SETTING_TEXT = {
-    "immediate charging": "sofort laden",
+    "immediatecharging": "sofort laden",
     "maximum": "maximal",
     "reduced": "reduziert",
     "permanent": "dauerhaft",
