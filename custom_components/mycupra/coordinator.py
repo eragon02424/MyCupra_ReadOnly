@@ -7,12 +7,15 @@ Ablauf pro Aktualisierung (alle 15 min):
 3. Pro Feld gewinnt der Wert aus der NEUESTEN Datei, in der das Feld vorkommt.
 4. Der Stand (Feldwerte + verarbeitete Dateien) wird in .storage gesichert, damit er
    einen HA-Neustart und das Herausfallen alter Dateien aus der Portal-Liste übersteht.
+5. Jede geladene ZIP wird zusätzlich unverändert unter /share/mycupra/<VIN>/ abgelegt und
+   nach 30 Tagen gelöscht (rawstore.py). Fehlende Dateien aus der aktuellen Portal-Liste
+   werden dabei nachgeladen, auch wenn sie schon ausgewertet waren.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components import persistent_notification
@@ -36,6 +39,7 @@ from .cupra_client import (
     CupraPermanentError,
     authorize_url,
 )
+from . import rawstore
 from .parsing import build_result, extract_fields, is_empty_file, merge_fields
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +88,58 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         # Meldung "Bestätigung bei VW nötig" (persistente Benachrichtigung in HA)
         self._notification_id = f"{DOMAIN}_{self.vin}_action_required"
         self._action_required_notified = False
+        # Ablage der Rohdateien
+        self._raw_dir = rawstore.raw_dir(self.vin)
+        self._raw_error_logged = False
+        # Nach einem Schreibfehler das Nachladen alter Dateien bis dahin aussetzen
+        self._raw_retry_after: datetime | None = None
+        self._last_prune: datetime | None = None
+
+    async def _store_raw(self, name: str, raw: bytes) -> None:
+        """Rohdatei ablegen. Ein Schreibfehler darf die Auswertung nie stoppen."""
+        try:
+            written = await self.hass.async_add_executor_job(
+                rawstore.save_raw, self._raw_dir, name, raw
+            )
+            if written:
+                _LOGGER.debug("Rohdatei %s abgelegt (%d Bytes) in %s", name, len(raw), self._raw_dir)
+            self._raw_error_logged = False
+            self._raw_retry_after = None
+        except (OSError, ValueError) as err:
+            self._raw_retry_after = datetime.now(timezone.utc) + timedelta(hours=6)
+            if not self._raw_error_logged:
+                _LOGGER.error("Rohdatei %s konnte nicht abgelegt werden (%s): %s", name, self._raw_dir, err)
+                self._raw_error_logged = True
+
+    async def _prune_raw(self) -> None:
+        now = datetime.now(timezone.utc)
+        if self._last_prune and now - self._last_prune < timedelta(hours=6):
+            return
+        self._last_prune = now
+        try:
+            removed = await self.hass.async_add_executor_job(rawstore.prune, self._raw_dir)
+            if removed:
+                _LOGGER.info(
+                    "%d Rohdatei(en) älter als %d Tage gelöscht.", removed, rawstore.RAW_RETENTION_DAYS
+                )
+        except OSError as err:
+            _LOGGER.warning("Aufräumen der Rohdateien fehlgeschlagen: %s", err)
+
+    async def _fetch_raw(self, name: str) -> bytes | None:
+        """Datei laden. None = vorübergehender Fehler (nächster Lauf versucht es erneut)."""
+        try:
+            return await self.hass.async_add_executor_job(self.client.download_file, name)
+        except CupraActionRequired as err:
+            self._notify_action_required(err)
+            raise UpdateFailed(
+                "Bestätigung bei VW nötig - siehe Benachrichtigung in Home Assistant"
+            ) from err
+        except CupraPermanentError as err:
+            _LOGGER.error("Dauerhafter Fehler beim Download von %s: %s", name, err)
+            raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
+        except CupraLoginError as err:
+            _LOGGER.warning("Download von %s fehlgeschlagen, nächster Lauf versucht es erneut: %s", name, err)
+            return None
 
     def _notify_action_required(self, err: CupraActionRequired) -> None:
         """VW verlangt eine Bestätigung im Browser: Fehler melden, nichts automatisch bestätigen."""
@@ -187,24 +243,31 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         previous = dict(self.data) if self.data else build_result(self._fields)
         state_changed = False
 
+        # Rohdateien nachholen: Dateien aus der Portal-Liste, die schon ausgewertet wurden,
+        # aber (noch) nicht auf der Platte liegen (z. B. erster Lauf nach Einführung der Ablage).
+        on_disk = await self.hass.async_add_executor_job(rawstore.existing_names, self._raw_dir)
+        backfill_blocked = bool(
+            self._raw_retry_after and datetime.now(timezone.utc) < self._raw_retry_after
+        )
+        backfill = [] if backfill_blocked else [
+            f for f in with_data if f["name"] in self._seen and f["name"] not in on_disk
+        ]
+        if backfill:
+            _LOGGER.info("Lade %d bereits ausgewertete Datei(en) zur Ablage nach.", len(backfill))
+        for entry in backfill:
+            raw = await self._fetch_raw(entry["name"])
+            if raw is not None:
+                await self._store_raw(entry["name"], raw)
+
         # Älteste zuerst; merge_fields sorgt dafür, dass pro Feld immer die neueste Datei gewinnt.
         for entry in new_data:
             name = entry["name"]
             created = entry.get("createdOn", "")
-            try:
-                raw = await self.hass.async_add_executor_job(self.client.download_file, name)
-            except CupraActionRequired as err:
-                self._notify_action_required(err)
-                raise UpdateFailed(
-                    "Bestätigung bei VW nötig - siehe Benachrichtigung in Home Assistant"
-                ) from err
-            except CupraPermanentError as err:
-                _LOGGER.error("Dauerhafter Fehler beim Download von %s: %s", name, err)
-                raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
-            except CupraLoginError as err:
+            raw = await self._fetch_raw(name)
+            if raw is None:
                 # Nicht als gesehen markieren, damit der nächste Lauf es erneut versucht.
-                _LOGGER.warning("Download von %s fehlgeschlagen, nächster Lauf versucht es erneut: %s", name, err)
                 continue
+            await self._store_raw(name, raw)
 
             fields = await self.hass.async_add_executor_job(extract_fields, raw, name)
             if fields is None:
@@ -241,6 +304,8 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
 
         if state_changed:
             await self._async_save()
+
+        await self._prune_raw()
 
         if not new_data:
             if self._fields:
