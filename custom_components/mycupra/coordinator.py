@@ -15,6 +15,7 @@ Ablauf pro Aktualisierung (alle 15 min):
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -40,7 +41,7 @@ from .cupra_client import (
     authorize_url,
 )
 from . import rawstore
-from .parsing import build_result, extract_fields, is_empty_file, merge_fields
+from .parsing import PARSE_VERSION, build_result, extract_fields, is_empty_file, merge_fields
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         self._field_ts: dict[str, str] = {}
         # Bereits verarbeitete Dateien: Dateiname -> createdOn
         self._seen: dict[str, str] = {}
+        self._reparse = False
         self._last_data_file: str | None = None
         self._last_data_file_ts: str | None = None
         self._last_data_file_size: int | None = None
@@ -183,9 +185,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
     async def _async_setup(self) -> None:
         """Gespeicherten Stand laden (wird vor dem ersten Abruf aufgerufen)."""
         stored = await self._store.async_load()
+        self._reparse = True
         if not stored:
             _LOGGER.info("Kein gespeicherter Stand vorhanden - starte mit leerem Zwischenspeicher.")
             return
+        self._reparse = stored.get("parse_version") != PARSE_VERSION
         self._fields = dict(stored.get("fields", {}))
         self._field_ts = dict(stored.get("field_ts", {}))
         self._seen = dict(stored.get("seen", {}))
@@ -203,11 +207,39 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
                 "fields": self._fields,
                 "field_ts": self._field_ts,
                 "seen": self._seen,
+                "parse_version": PARSE_VERSION,
                 "last_data_file": self._last_data_file,
                 "last_data_file_ts": self._last_data_file_ts,
                 "last_data_file_size": self._last_data_file_size,
             }
         )
+
+    async def _reparse_raw(self) -> None:
+        """Alle abgelegten ZIPs mit der aktuellen Auswertung erneut zusammenführen."""
+
+        def _work() -> int:
+            count = 0
+            for name in sorted(rawstore.existing_names(self._raw_dir)):
+                ts = self._seen.get(name)
+                if not ts:
+                    stamp = rawstore.name_timestamp(name)
+                    if stamp is None:
+                        continue
+                    ts = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+                try:
+                    with open(os.path.join(self._raw_dir, name), "rb") as fh:
+                        raw = fh.read()
+                except OSError:
+                    continue
+                fields = extract_fields(raw, name)
+                if fields:
+                    merge_fields(self._fields, self._field_ts, fields, ts)
+                    count += 1
+            return count
+
+        count = await self.hass.async_add_executor_job(_work)
+        self._reparse = False
+        _LOGGER.info("Auswertung %s: %d abgelegte Datei(en) neu eingelesen.", PARSE_VERSION, count)
 
     async def _async_update_data(self) -> dict:
         _LOGGER.debug("Aktualisierung gestartet")
@@ -242,6 +274,12 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
 
         previous = dict(self.data) if self.data else build_result(self._fields)
         state_changed = False
+
+        # Neue Auswertungsversion: abgelegte Rohdateien einmal neu einlesen (älteste zuerst),
+        # damit neue Felder sofort Werte haben. Bestehende Werte werden nur durch neuere ersetzt.
+        if self._reparse:
+            await self._reparse_raw()
+            state_changed = True
 
         # Rohdateien nachholen: Dateien aus der Portal-Liste, die schon ausgewertet wurden,
         # aber (noch) nicht auf der Platte liegen (z. B. erster Lauf nach Einführung der Ablage).
