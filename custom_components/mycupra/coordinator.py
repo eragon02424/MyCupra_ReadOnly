@@ -15,6 +15,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
+from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -28,7 +29,13 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
 )
-from .cupra_client import CupraClient, CupraLoginError, CupraPermanentError
+from .cupra_client import (
+    CupraActionRequired,
+    CupraClient,
+    CupraLoginError,
+    CupraPermanentError,
+    authorize_url,
+)
 from .parsing import build_result, extract_fields, is_empty_file, merge_fields
 
 _LOGGER = logging.getLogger(__name__)
@@ -74,6 +81,48 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         self._last_data_file: str | None = None
         self._last_data_file_ts: str | None = None
         self._last_data_file_size: int | None = None
+        # Meldung "Bestätigung bei VW nötig" (persistente Benachrichtigung in HA)
+        self._notification_id = f"{DOMAIN}_{self.vin}_action_required"
+        self._action_required_notified = False
+
+    def _notify_action_required(self, err: CupraActionRequired) -> None:
+        """VW verlangt eine Bestätigung im Browser: Fehler melden, nichts automatisch bestätigen."""
+        _LOGGER.error(
+            "VW verlangt eine Bestätigung im Browser (Login-Schritt %s, Seite %s, Titel %r). "
+            "Das Add-on bestätigt nichts automatisch. Link und Anleitung stehen in der "
+            "Home-Assistant-Benachrichtigung.",
+            err.step, err.page, err.title,
+        )
+        if self._action_required_notified:
+            return
+        interval = int(self.update_interval.total_seconds() // 60) if self.update_interval else 15
+        message = (
+            "VW zeigt beim Login des Add-ons eine Seite, die nur du bestätigen kannst "
+            "(vermutlich geänderte Nutzungs- oder Datenschutzbedingungen). "
+            "Das Add-on bestätigt nichts automatisch und holt bis dahin keine neuen Daten.\n\n"
+            "**So geht es weiter**\n"
+            f"1. Diesen Link im Browser öffnen (PC oder Handy): [VW-Anmeldung öffnen]({authorize_url()})\n"
+            "2. Mit dem VW-/Cupra-Konto anmelden.\n"
+            "3. Die angezeigte Seite lesen und selbst bestätigen.\n"
+            f"4. Danach läuft die Integration beim nächsten Abruf (alle {interval} Minuten) "
+            "von selbst weiter, diese Meldung verschwindet dann.\n\n"
+            "Hilfe in Claude: einfach diese Meldung nennen, die Anleitung steht im Second Brain "
+            "(konzepte/vw-zustimmung).\n\n"
+            f"Technische Angaben: Login-Schritt {err.step}, Seite `{err.page}`, Titel: {err.title!r}."
+        )
+        persistent_notification.async_create(
+            self.hass,
+            message,
+            title="MyCupra: Bestätigung bei VW nötig",
+            notification_id=self._notification_id,
+        )
+        self._action_required_notified = True
+
+    def _clear_action_required(self) -> None:
+        if self._action_required_notified:
+            persistent_notification.async_dismiss(self.hass, self._notification_id)
+            self._action_required_notified = False
+            _LOGGER.info("Login wieder möglich - Meldung 'Bestätigung bei VW nötig' entfernt.")
 
     async def _async_setup(self) -> None:
         """Gespeicherten Stand laden (wird vor dem ersten Abruf aufgerufen)."""
@@ -108,6 +157,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         _LOGGER.debug("Aktualisierung gestartet")
         try:
             files = await self.hass.async_add_executor_job(self.client.list_files)
+        except CupraActionRequired as err:
+            self._notify_action_required(err)
+            raise UpdateFailed(
+                "Bestätigung bei VW nötig - siehe Benachrichtigung in Home Assistant"
+            ) from err
         except CupraPermanentError as err:
             _LOGGER.error("Dauerhafter Fehler bei der Dateiliste: %s", err)
             raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
@@ -115,6 +169,7 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             _LOGGER.warning("Dateiliste nicht abrufbar: %s", err)
             raise UpdateFailed(f"Datenabruf fehlgeschlagen: {err}") from err
 
+        self._clear_action_required()
         files = sorted(files, key=lambda f: f.get("createdOn", ""))
         empty = [f for f in files if is_empty_file(f)]
         with_data = [f for f in files if not is_empty_file(f)]
@@ -138,6 +193,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             created = entry.get("createdOn", "")
             try:
                 raw = await self.hass.async_add_executor_job(self.client.download_file, name)
+            except CupraActionRequired as err:
+                self._notify_action_required(err)
+                raise UpdateFailed(
+                    "Bestätigung bei VW nötig - siehe Benachrichtigung in Home Assistant"
+                ) from err
             except CupraPermanentError as err:
                 _LOGGER.error("Dauerhafter Fehler beim Download von %s: %s", name, err)
                 raise UpdateFailed(f"Dauerhafter Fehler, Konfiguration prüfen: {err}") from err
