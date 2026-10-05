@@ -21,13 +21,19 @@ EMPTY_FILE_MAX_BYTES = 300
 
 # Version der Auswertung. Wird sie erhöht, werden die abgelegten Rohdateien einmal neu
 # eingelesen (neue Felder bekommen dadurch sofort einen Wert).
-PARSE_VERSION = 2
+PARSE_VERSION = 3
 
 # Felder, die nach UUID-Key statt nach Namen gelesen werden, weil der Name allein nicht
 # eindeutig ist. Quelle: Data Dictionary "Continuous Data" v1.0.6.
 KEY_FIELDS: dict[str, str] = {
     # Name "value": "Value of the primary range" (Reichweite in km)
     "0ca40e18-0564-3eda-bcc0-7aee9ef44f04": "key:range_primary",
+    # Ladezustand: drei Einträge gleichen Namens, nur dieser ändert sich mit der Ladung
+    # (am 04./05.10.2026 gegen die go-e Wallbox verifiziert; die anderen beiden sind konstant).
+    "a08cca2b-ed42-37bc-b160-d015ce205d3d": "key:charge_state",
+    # Aktuelle Ladeleistung (kW) und Restladezeit; die übrigen Einträge gleichen Namens sind konstant.
+    "c8cb205f-01c6-3c81-bda1-059b99ae6515": "key:charge_power",
+    "7405c11f-4d20-36d2-8381-18364aa1f444": "key:remaining_time",
 }
 
 # Zeitstempel, aus denen der "Datenstand" (neueste Fahrzeugmeldung in der Datei) gebildet wird.
@@ -215,16 +221,30 @@ def build_result(fields: dict[str, str]) -> dict[str, Any]:
         fields.get("car_captured_utc_timestamp")
     )
 
+    # Ladezustand key-genau; Fallback auf den Namen, falls der Key (noch) nicht vorkam.
+    charge_state = fields.get("key:charge_state") or fields.get(
+        "charging_state_report.current_charge_state"
+    )
+    charging = charge_state == "CHARGE_STATE_CHARGING_HV_BATTERY"
+    # Restladezeit nur während des Ladens (am Ladeende meldet das Fahrzeug 60 s).
+    remaining = _seconds_to_minutes_positive("key:remaining_time") if charging else None
+    if "key:remaining_time" not in fields:
+        remaining = _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete")
+    power = _float("key:charge_power")
+    if power is None:
+        power = _float("battery_state_report.charge_power")
+
     return {
         # Batterie
         "soc": soc,
         "current_energy_kwh": round(current_energy / 10, 2) if current_energy is not None else None,
         "max_energy_kwh": round(max_energy / 10, 2) if max_energy is not None else None,
         "range_km": _int_positive("key:range_primary"),
-        "charge_power_kw": _float("battery_state_report.charge_power"),
+        "charge_power_kw": power,
         "charge_rate_km_h": _float_positive("battery_state_report.charge_rate"),
-        "remaining_charge_min": _seconds_to_minutes_positive("battery_state_report.remaining_charging_time_complete"),
-        # Energie der letzten Ladung (laut Jonathan = Wert aus dem Ladeverlauf der App, ca.)
+        "remaining_charge_min": remaining,
+        # Energie des letzten Ladeblocks (Wallbox 04./05.10.2026: 0,5/2,5/4,5 kWh gegen 0,57/2,56/4,63 kWh;
+        # die App zeigt dafür gerundete Werte, z. B. 18,0 gegen "~19 kWh")
         "last_charge_energy_kwh": _float_positive("battery_state_report.charge_energy"),
         "target_soc": _int("settings.target_soc"),
         "battery_care_limit": _int("battery_care_mode.charge_bcam_threshold"),
@@ -239,7 +259,7 @@ def build_result(fields: dict[str, str]) -> dict[str, Any]:
         "ascent_consumption": _float("slope_consumption_values.ascent_slope_consumption.physical_value"),
         "descent_consumption": _float("slope_consumption_values.descent_slope_consumption.physical_value"),
         # Status (Text)
-        "charge_state": fields.get("charging_state_report.current_charge_state"),
+        "charge_state": charge_state,
         "charge_type": fields.get("charging_state_report.charge_type"),
         "charge_mode": fields.get("charging_state_report.charge_mode"),
         "update_reason": fields.get("update_reason"),
