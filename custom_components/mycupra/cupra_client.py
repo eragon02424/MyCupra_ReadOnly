@@ -70,6 +70,13 @@ REDIRECT_URI = "https://eu-data-act.drivesomethinggreater.com/login"
 IDENTITY_BASE = "https://identity.vwgroup.io"
 PORTAL_BASE = "https://eu-data-act.drivesomethinggreater.com"
 DEFAULT_REQUEST_IDENTIFIER = ""
+# Pfadteile von VW-Seiten, die nur der Nutzer selbst bestätigen kann (Weiterleitungsziele im Login).
+# Bewusst NICHT "consent": der normale Login läuft über eine .../consent/...-Weiterleitung (Schritt 7).
+ACTION_REDIRECT_MARKERS = (
+    "terms-and-conditions",
+    "data-privacy",
+    "privacy-policy",
+)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
@@ -232,6 +239,29 @@ class CupraClient:
             )
         raise CupraLoginError(f"Login-Schritt {step} fehlgeschlagen: HTTP {status} bei {page}")
 
+    @staticmethod
+    def _check_action_redirect(step, location):
+        """Weiterleitung auf eine Seite, die nur der Nutzer bestätigen kann?
+
+        VW schickt bei geänderten Nutzungs-/Datenschutzbedingungen keine Seite (HTTP 200),
+        sondern leitet per 303/302 auf z. B. .../terms-and-conditions?...&updated=termsofuse
+        weiter (beobachtet am 2026-10-19/20). Solche Ziele -> CupraActionRequired, damit
+        Home Assistant die Meldung mit Login-Link zeigt. Es wird nichts automatisch bestätigt.
+        """
+        path = _safe(location).lower()
+        if not any(marker in path for marker in ACTION_REDIRECT_MARKERS):
+            return
+        page = _safe(location)
+        logger.error(
+            "Login-Schritt %s/9: VW leitet auf eine Bestätigungsseite weiter (%s) - "
+            "Bestätigung durch den Nutzer nötig, es wird nichts automatisch bestätigt.",
+            step, page,
+        )
+        raise CupraActionRequired(
+            f"Login-Schritt {step}: VW verlangt eine Bestätigung im Browser ({page})",
+            step=step, page=page, title="Weiterleitung (keine Seite)",
+        )
+
     def _get_cookie(self, name):
         for cookie in self.cookie_jar:
             if cookie.name == name:
@@ -332,11 +362,13 @@ class CupraClient:
             if "error=" in loc:
                 m = re.search(r"error=([\w.]+)", loc)
                 raise CupraPermanentError(f"Login abgelehnt: {m.group(1) if m else 'unbekannt'}")
-            raise CupraLoginError(f"Unerwarteter 303: {loc}")
+            self._check_action_redirect(5, loc)
+            raise CupraLoginError(f"Unerwarteter 303: {_safe(loc)}")
         if status != 302:
             self._unexpected_step(5, status, authenticate_url, body)
         sso_url = headers["Location"]
         logger.debug("5/9 Location: %s", _safe(sso_url))
+        self._check_action_redirect(5, sso_url)
 
         logger.info("Schritt 6/9: SSO-Redirect folgen")
         status, headers, body = self._request("GET", sso_url)
@@ -345,6 +377,7 @@ class CupraClient:
             self._unexpected_step(6, status, sso_url, body)
         consent_url = headers["Location"]
         logger.debug("6/9 Location: %s", _safe(consent_url))
+        self._check_action_redirect(6, consent_url)
 
         logger.info("Schritt 7/9: Consent-Redirect folgen")
         status, headers, body = self._request("GET", consent_url)
@@ -353,6 +386,7 @@ class CupraClient:
             self._unexpected_step(7, status, consent_url, body)
         callback_success_url = headers["Location"]
         logger.debug("7/9 Location: %s", _safe(callback_success_url))
+        self._check_action_redirect(7, callback_success_url)
 
         logger.info("Schritt 8/9: Callback/success -> Authorization Code")
         status, headers, body = self._request("GET", callback_success_url)
