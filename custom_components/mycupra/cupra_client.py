@@ -70,8 +70,10 @@ REDIRECT_URI = "https://eu-data-act.drivesomethinggreater.com/login"
 IDENTITY_BASE = "https://identity.vwgroup.io"
 PORTAL_BASE = "https://eu-data-act.drivesomethinggreater.com"
 DEFAULT_REQUEST_IDENTIFIER = ""
+# Höchstzahl Weiterleitungen im Login (Auth0 -> VW -> Portal), Schutz gegen Schleifen.
+MAX_LOGIN_REDIRECTS = 15
 # Pfadteile von VW-Seiten, die nur der Nutzer selbst bestätigen kann (Weiterleitungsziele im Login).
-# Bewusst NICHT "consent": der normale Login läuft über eine .../consent/...-Weiterleitung (Schritt 7).
+# Bewusst NICHT "consent": der normale Login lief über eine .../consent/...-Weiterleitung.
 ACTION_REDIRECT_MARKERS = (
     "terms-and-conditions",
     "data-privacy",
@@ -196,27 +198,11 @@ class CupraClient:
             raise CupraRetryableError(f"Timeout/OS-Fehler bei {_safe(url)}: {e!r}")
 
     @staticmethod
-    def _extract_hidden_inputs(html):
-        result = {}
-        for name in ("_csrf", "relayState", "hmac"):
-            m = re.search(rf'name="{name}"\s+value="([^"]*)"', html)
-            if m:
-                result[name] = m.group(1)
-        return result
+    def _extract_form_state(html):
+        """Verstecktes Feld "state" des Auth0-Anmeldeformulars (Universal Login)."""
+        m = re.search(r'name="state"\s+value="([^"]*)"', html) or re.search(r'value="([^"]*)"\s+name="state"', html)
+        return m.group(1) if m else None
 
-    @staticmethod
-    def _extract_js_model_fields(html):
-        result = {}
-        m = re.search(r"csrf_token:\s*'([^']*)'", html)
-        if m:
-            result["_csrf"] = m.group(1)
-        m = re.search(r'"hmac":"([^"]*)"', html)
-        if m:
-            result["hmac"] = m.group(1)
-        m = re.search(r'"relayState":"([^"]*)"', html)
-        if m:
-            result["relayState"] = m.group(1)
-        return result
 
     def _unexpected_step(self, step, status, url, body):
         """Login-Schritt lieferte keine Weiterleitung.
@@ -229,7 +215,7 @@ class CupraClient:
         if status == 200:
             title = _page_title(body)
             logger.error(
-                "Login-Schritt %s/9: VW zeigt eine Seite statt einer Weiterleitung (%s, Titel: %r) - "
+                "Login-Schritt %s/3: VW zeigt eine Seite statt einer Weiterleitung (%s, Titel: %r) - "
                 "Bestätigung durch den Nutzer nötig, es wird nichts automatisch bestätigt.",
                 step, page, title,
             )
@@ -253,7 +239,7 @@ class CupraClient:
             return
         page = _safe(location)
         logger.error(
-            "Login-Schritt %s/9: VW leitet auf eine Bestätigungsseite weiter (%s) - "
+            "Login-Schritt %s/3: VW leitet auf eine Bestätigungsseite weiter (%s) - "
             "Bestätigung durch den Nutzer nötig, es wird nichts automatisch bestätigt.",
             step, page,
         )
@@ -312,104 +298,65 @@ class CupraClient:
                                    attempt, self.MAX_ATTEMPTS, e)
         raise CupraLoginError(f"Nach {self.MAX_ATTEMPTS} Versuchen fehlgeschlagen: {last_error}")
 
+    def _follow_redirects(self, step, status, headers, body, url):
+        """Folgt Weiterleitungen (GET), bis eine Antwort ohne Weiterleitung kommt.
+
+        Jede Zieladresse wird auf VW-Bestätigungsseiten geprüft (CupraActionRequired).
+        Gibt (status, headers, body, url) der letzten Antwort zurück.
+        """
+        for _hop in range(MAX_LOGIN_REDIRECTS):
+            if status not in (301, 302, 303, 307, 308):
+                return status, headers, body, url
+            location = headers.get("Location", "")
+            if not location:
+                raise CupraLoginError(f"Login-Schritt {step}: Weiterleitung ohne Ziel bei {_safe(url)}")
+            url = urllib.parse.urljoin(url, location)
+            logger.debug("%s/3 Weiterleitung -> %s", step, _safe(url))
+            self._check_action_redirect(step, url)
+            status, headers, body = self._request("GET", url)
+        raise CupraLoginError(f"Login-Schritt {step}: mehr als {MAX_LOGIN_REDIRECTS} Weiterleitungen")
+
     def login(self):
-        logger.info("Schritt 1/9: Authorize-Request")
+        """Anmeldung über VW Identity (seit 2026-10-26 Auth0 Universal Login, /u/login).
+
+        Ablauf (am 2026-10-28 im Browser beobachtet):
+        1. Authorize-URL aufrufen -> Weiterleitung auf /u/login?state=... (Anmeldeseite)
+        2. Formular mit state, username, password, action=default an dieselbe URL senden
+        3. Weiterleitungen folgen bis ins Portal; dort setzt das Portal das Cookie access_token.
+        """
+        self.cookie_jar.clear()
+
+        logger.info("Schritt 1/3: Anmeldeseite laden")
         url = authorize_url()
-        status, headers, _ = self._request("GET", url)
-        logger.debug("1/9 GET %s -> HTTP %s", _safe(url), status)
-        if status != 302:
-            raise CupraLoginError(f"Authorize fehlgeschlagen: HTTP {status}")
-        signin_url = headers["Location"]
-        logger.debug("1/9 Location: %s", _safe(signin_url))
+        status, headers, body = self._request("GET", url)
+        status, headers, body, login_url = self._follow_redirects(1, status, headers, body, url)
+        if status != 200:
+            raise CupraLoginError(f"Anmeldeseite nicht erreichbar: HTTP {status} bei {_safe(login_url)}")
+        state = self._extract_form_state(body.decode("utf-8", errors="replace"))
+        if not state:
+            raise CupraLoginError(f"Anmeldeformular nicht erkannt (kein state-Feld) bei {_safe(login_url)}")
+        logger.debug("1/3 Anmeldeseite: %s", _safe(login_url))
 
-        logger.info("Schritt 2/9: Signin-Seite laden")
-        status, headers, body = self._request("GET", signin_url)
-        logger.debug("2/9 GET %s -> HTTP %s (%d Bytes)", _safe(signin_url), status, len(body))
-        fields = self._extract_hidden_inputs(body.decode("utf-8"))
-        logger.debug("2/9 Extrahierte Felder: %s", list(fields.keys()))
-        if not fields.get("_csrf"):
-            raise CupraLoginError("CSRF nicht extrahierbar (Signin).")
+        logger.info("Schritt 2/3: Zugangsdaten senden")
+        try:
+            status, headers, body = self._request("POST", login_url, data={
+                "state": state, "username": self.email, "password": self.password, "action": "default",
+            })
+        except CupraLoginError as err:
+            if "HTTP 400" in str(err) or "HTTP 401" in str(err) or "HTTP 403" in str(err):
+                raise CupraPermanentError(f"Login abgelehnt (E-Mail/Passwort prüfen): {err}") from err
+            raise
+        if status == 200:
+            # Keine Weiterleitung: Auth0 zeigt die Seite erneut (z. B. Fehler, Captcha, Zusatzabfrage)
+            self._unexpected_step(2, status, login_url, body)
 
-        logger.info("Schritt 3/9: E-Mail senden")
-        post_url = signin_url.split("?")[0].replace("/signin/", "/") + "/login/identifier"
-        status, headers, _ = self._request("POST", post_url, data={
-            "_csrf": fields["_csrf"], "relayState": fields["relayState"],
-            "hmac": fields["hmac"], "email": self.email,
-        })
-        logger.debug("3/9 POST %s -> HTTP %s", post_url, status)
-        if status != 303:
-            raise CupraLoginError(f"E-Mail-Schritt fehlgeschlagen: HTTP {status}")
-        authenticate_url = IDENTITY_BASE + headers["Location"]
-        logger.debug("3/9 Location: %s", _safe(authenticate_url))
-
-        logger.info("Schritt 4/9: Passwort-Seite laden")
-        status, headers, body = self._request("GET", authenticate_url)
-        logger.debug("4/9 GET %s -> HTTP %s (%d Bytes)", _safe(authenticate_url), status, len(body))
-        pw_fields = self._extract_js_model_fields(body.decode("utf-8"))
-        logger.debug("4/9 Extrahierte Felder: %s", list(pw_fields.keys()))
-        if not pw_fields.get("_csrf"):
-            raise CupraLoginError("CSRF nicht extrahierbar (Passwort).")
-
-        logger.info("Schritt 5/9: Passwort senden")
-        status, headers, body = self._request("POST", authenticate_url.split("?")[0], data={
-            "_csrf": pw_fields["_csrf"], "relayState": pw_fields["relayState"],
-            "hmac": pw_fields["hmac"], "email": self.email, "password": self.password,
-        })
-        logger.debug("5/9 POST %s -> HTTP %s", authenticate_url.split("?")[0], status)
-        if status == 303:
-            loc = headers.get("Location", "")
-            logger.debug("5/9 303-Location: %s", _safe(loc))
-            if "error=" in loc:
-                m = re.search(r"error=([\w.]+)", loc)
-                raise CupraPermanentError(f"Login abgelehnt: {m.group(1) if m else 'unbekannt'}")
-            self._check_action_redirect(5, loc)
-            raise CupraLoginError(f"Unerwarteter 303: {_safe(loc)}")
-        if status != 302:
-            self._unexpected_step(5, status, authenticate_url, body)
-        sso_url = headers["Location"]
-        logger.debug("5/9 Location: %s", _safe(sso_url))
-        self._check_action_redirect(5, sso_url)
-
-        logger.info("Schritt 6/9: SSO-Redirect folgen")
-        status, headers, body = self._request("GET", sso_url)
-        logger.debug("6/9 GET %s -> HTTP %s (%d Bytes)", _safe(sso_url), status, len(body))
-        if status != 302:
-            self._unexpected_step(6, status, sso_url, body)
-        consent_url = headers["Location"]
-        logger.debug("6/9 Location: %s", _safe(consent_url))
-        self._check_action_redirect(6, consent_url)
-
-        logger.info("Schritt 7/9: Consent-Redirect folgen")
-        status, headers, body = self._request("GET", consent_url)
-        logger.debug("7/9 GET %s -> HTTP %s (%d Bytes)", _safe(consent_url), status, len(body))
-        if status != 302:
-            self._unexpected_step(7, status, consent_url, body)
-        callback_success_url = headers["Location"]
-        logger.debug("7/9 Location: %s", _safe(callback_success_url))
-        self._check_action_redirect(7, callback_success_url)
-
-        logger.info("Schritt 8/9: Callback/success -> Authorization Code")
-        status, headers, body = self._request("GET", callback_success_url)
-        logger.debug("8/9 GET %s -> HTTP %s", _safe(callback_success_url), status)
-        if status != 302:
-            self._unexpected_step(8, status, callback_success_url, body)
-        portal_login_url = headers["Location"]
-        logger.debug("8/9 Location: %s", _safe(portal_login_url))
-
-        logger.info("Schritt 9/9: Code beim Portal einlösen")
-        status, headers, body = self._request("GET", portal_login_url)
-        logger.debug("9/9 GET %s -> HTTP %s", _safe(portal_login_url), status)
-        if status != 302:
-            self._unexpected_step(9, status, portal_login_url, body)
-        callback_login_url = headers["Location"]
-        status, headers, body = self._request("GET", callback_login_url)
-        logger.debug("9/9 GET %s -> HTTP %s", _safe(callback_login_url), status)
-        if status != 302:
-            self._unexpected_step(9, status, callback_login_url, body)
-        logger.debug("9/9 Finale Location: %s", _safe(headers.get("Location", "")))
-
+        logger.info("Schritt 3/3: Weiterleitungen bis ins Portal folgen")
+        status, headers, body, final_url = self._follow_redirects(3, status, headers, body, login_url)
         if not self._get_cookie("access_token"):
-            raise CupraLoginError("Kein access_token nach Login erhalten.")
+            if status == 200 and urllib.parse.urlsplit(final_url).hostname != urllib.parse.urlsplit(PORTAL_BASE).hostname:
+                self._unexpected_step(3, status, final_url, body)
+            raise CupraLoginError(f"Kein access_token nach Login erhalten (letzte Seite {_safe(final_url)}, HTTP {status}).")
+        logger.debug("3/3 Ende: %s (HTTP %s)", _safe(final_url), status)
 
         try:
             payload = self._decode_jwt_payload(self._get_cookie("access_token"))

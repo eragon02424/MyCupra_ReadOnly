@@ -24,6 +24,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_DEVICE_NAME,
@@ -46,6 +47,10 @@ from .parsing import PARSE_VERSION, build_result, extract_fields, is_empty_file,
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
+
+# Nach dieser Dauer ohne erfolgreichen Abruf erscheint die Meldung "MyCupra: keine Daten".
+# Kürzere Aussetzer (z. B. Abruflimit des Portals, einzelne Timeouts) lösen sie nicht aus.
+OUTAGE_NOTIFY_AFTER = timedelta(hours=1)
 
 # Werte, deren Änderung als INFO ins Log geschrieben wird.
 _LOGGED_KEYS = ("soc", "mileage_km", "charge_state", "locked", "car_captured_at")
@@ -90,6 +95,11 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         # Meldung "Bestätigung bei VW nötig" (persistente Benachrichtigung in HA)
         self._notification_id = f"{DOMAIN}_{self.vin}_action_required"
         self._action_required_notified = False
+        # Meldung "MyCupra: keine Daten" bei längerer Störung
+        self._outage_notification_id = f"{DOMAIN}_{self.vin}_outage"
+        self._outage_notified = False
+        self._first_failure: datetime | None = None
+        self._last_success: datetime | None = None
         # Ablage der Rohdateien
         self._raw_dir = rawstore.raw_dir(self.vin)
         self._raw_error_logged = False
@@ -182,6 +192,64 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
             self._action_required_notified = False
             _LOGGER.info("Login wieder möglich - Meldung 'Bestätigung bei VW nötig' entfernt.")
 
+    @staticmethod
+    def _describe_error(err: BaseException) -> str:
+        """Fehlerursache in Klartext für die Meldung."""
+        text = str(err)
+        cause = err.__cause__ or err
+        cause_text = f"{text} {cause}".lower()
+        if "certificate has expired" in cause_text or "certificate_verify_failed" in cause_text:
+            return "Das Sicherheitszertifikat des Portals ist ungültig oder abgelaufen (Fehler auf VW-Seite)."
+        if "login abgelehnt" in cause_text:
+            return "VW lehnt die Anmeldung ab (E-Mail/Passwort prüfen)."
+        if "netzwerkfehler" in cause_text or "timeout" in cause_text:
+            return "Das Portal ist nicht erreichbar (Netzwerk/Zeitüberschreitung)."
+        if "http 429" in cause_text:
+            return "Das Portal begrenzt die Abrufe (HTTP 429)."
+        if "anmeldeformular nicht erkannt" in cause_text or "unknown url type" in cause_text:
+            return "Die VW-Anmeldeseite hat sich geändert - die Integration muss angepasst werden."
+        return "Unbekannter Fehler - Details im Log (custom_components.mycupra)."
+
+    def _note_failure(self, err: BaseException) -> None:
+        """Fehlschlag merken; nach OUTAGE_NOTIFY_AFTER eine Meldung in HA anzeigen."""
+        now = datetime.now(timezone.utc)
+        if self._first_failure is None:
+            self._first_failure = now
+        if self._outage_notified or self._action_required_notified:
+            return
+        if now - self._first_failure < OUTAGE_NOTIFY_AFTER:
+            return
+        since = dt_util.as_local(self._first_failure).strftime("%d.%m.%Y %H:%M")
+        last_ok = (
+            dt_util.as_local(self._last_success).strftime("%d.%m.%Y %H:%M")
+            if self._last_success else "seit dem Start von Home Assistant noch keiner"
+        )
+        message = (
+            f"Die Integration holt seit **{since}** keine neuen Daten mehr.\n\n"
+            f"**Ursache:** {self._describe_error(err)}\n\n"
+            f"Letzter erfolgreicher Abruf: {last_ok}. Die Sensoren zeigen bis dahin den letzten Stand. "
+            "Die Integration versucht es weiter alle paar Minuten; läuft es wieder, verschwindet diese "
+            "Meldung von selbst. Das Portal hält nur ca. 7,5 Stunden an Dateien vor, bei längeren "
+            "Ausfällen entsteht eine Lücke.\n\n"
+            f"Technische Angabe: `{str(err)[:300]}`"
+        )
+        persistent_notification.async_create(
+            self.hass,
+            message,
+            title="MyCupra: keine Daten",
+            notification_id=self._outage_notification_id,
+        )
+        self._outage_notified = True
+        _LOGGER.error("Seit %s keine Daten - Meldung 'MyCupra: keine Daten' angezeigt: %s", since, err)
+
+    def _note_success(self) -> None:
+        self._last_success = datetime.now(timezone.utc)
+        self._first_failure = None
+        if self._outage_notified:
+            persistent_notification.async_dismiss(self.hass, self._outage_notification_id)
+            self._outage_notified = False
+            _LOGGER.info("Datenabruf läuft wieder - Meldung 'MyCupra: keine Daten' entfernt.")
+
     async def _async_setup(self) -> None:
         """Gespeicherten Stand laden (wird vor dem ersten Abruf aufgerufen)."""
         stored = await self._store.async_load()
@@ -242,6 +310,19 @@ class MyCupraCoordinator(DataUpdateCoordinator[dict]):
         _LOGGER.info("Auswertung %s: %d abgelegte Datei(en) neu eingelesen.", PARSE_VERSION, count)
 
     async def _async_update_data(self) -> dict:
+        """Ein Abruf; Fehlschläge und Erfolge werden für die Störungsmeldung gezählt."""
+        try:
+            result = await self._async_update_once()
+        except UpdateFailed as err:
+            self._note_failure(err)
+            raise
+        except Exception as err:  # noqa: BLE001 - auch unerwartete Fehler sollen gemeldet werden
+            self._note_failure(err)
+            raise UpdateFailed(f"Unerwarteter Fehler: {err!r}") from err
+        self._note_success()
+        return result
+
+    async def _async_update_once(self) -> dict:
         _LOGGER.debug("Aktualisierung gestartet")
         try:
             files = await self.hass.async_add_executor_job(self.client.list_files)
