@@ -21,7 +21,7 @@ EMPTY_FILE_MAX_BYTES = 300
 
 # Version der Auswertung. Wird sie erhöht, werden die abgelegten Rohdateien einmal neu
 # eingelesen (neue Felder bekommen dadurch sofort einen Wert).
-PARSE_VERSION = 3
+PARSE_VERSION = 4
 
 # Felder, die nach UUID-Key statt nach Namen gelesen werden, weil der Name allein nicht
 # eindeutig ist. Quelle: Data Dictionary "Continuous Data" v1.0.6.
@@ -43,6 +43,13 @@ LATEST_SOURCES = (
     "profile_state_report.car_captured_time",
 )
 LATEST_FIELD = "_latest_capture"
+
+# Zählerfelder, die physikalisch nur steigen können. Das Fahrzeug liefert den Kilometerstand
+# teils aus zwei Meldungen gleichzeitig (Keys 30cc36fd und 75d65f00), eine davon veraltet
+# (z. B. 15849 und 15845 in derselben Datei am 22.10.2026). Hier gewinnt der größte Wert:
+# innerhalb einer Datei und auch über Dateien hinweg (eine neuere Datei kann nur die
+# veraltete Meldung enthalten).
+MONOTONIC_FIELDS = ("mileage.value",)
 
 
 def is_empty_file(entry: dict) -> bool:
@@ -72,7 +79,8 @@ def extract_fields(raw_bytes: bytes, filename: str = "?") -> dict[str, str] | No
     """Liest eine Daten-ZIP und liefert {dataFieldName: value}.
 
     Mehrfach vorkommende Feldnamen: der erste Wert in der Datei gewinnt (wie bisher,
-    am 11.07.2026 gegen die Cupra-App verifiziert). Zusätzlich:
+    am 11.07.2026 gegen die Cupra-App verifiziert), außer bei MONOTONIC_FIELDS (größter
+    Wert). Zusätzlich:
     - Felder aus KEY_FIELDS stehen unter ihrem Key-Pseudonamen ("key:...").
     - LATEST_FIELD enthält den neuesten Fahrzeug-Zeitstempel der ganzen Datei.
     Gibt None zurück, wenn die Datei nicht lesbar ist.
@@ -96,7 +104,10 @@ def extract_fields(raw_bytes: bytes, filename: str = "?") -> dict[str, str] | No
         key = entry.get("key", "")
         if key in KEY_FIELDS:
             fields[KEY_FIELDS[key]] = value
-        if name and name not in fields:
+        if name in MONOTONIC_FIELDS:
+            if _is_larger(value, fields.get(name)):
+                fields[name] = value
+        elif name and name not in fields:
             fields[name] = value
         if name in LATEST_SOURCES:
             parsed = _parse_timestamp(value)
@@ -105,6 +116,18 @@ def extract_fields(raw_bytes: bytes, filename: str = "?") -> dict[str, str] | No
     if latest is not None:
         fields[LATEST_FIELD] = latest.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return fields
+
+
+def _is_larger(new: str | None, old: str | None) -> bool:
+    """True, wenn new als Zahl größer ist als old (oder old fehlt/unlesbar ist)."""
+    try:
+        new_num = float(new)
+    except (TypeError, ValueError):
+        return False
+    try:
+        return new_num > float(old)
+    except (TypeError, ValueError):
+        return True
 
 
 def merge_fields(
@@ -118,7 +141,8 @@ def merge_fields(
     Felder. So gewinnt pro Feld immer der Wert aus der neuesten Datei, egal in welcher
     Reihenfolge die Dateien verarbeitet werden.
 
-    Ausnahme LATEST_FIELD (Datenstand): hier gewinnt immer der größte Zeitstempel.
+    Ausnahmen: LATEST_FIELD (Datenstand) – hier gewinnt immer der größte Zeitstempel;
+    MONOTONIC_FIELDS (Kilometerstand) – hier gewinnt immer der größte Wert.
     """
     changed = 0
     for name, value in new_fields.items():
@@ -126,6 +150,13 @@ def merge_fields(
             old = _parse_timestamp(store.get(name))
             new = _parse_timestamp(value)
             if new is not None and (old is None or new > old):
+                store[name] = value
+                store_ts[name] = file_ts
+                changed += 1
+            continue
+        if name in MONOTONIC_FIELDS:
+            # Zähler: nur ein größerer Wert ersetzt den bisherigen (siehe MONOTONIC_FIELDS)
+            if _is_larger(value, store.get(name)):
                 store[name] = value
                 store_ts[name] = file_ts
                 changed += 1
